@@ -54,3 +54,4 @@ def main(name,妖精=0):
 		"LV": 0,        #初始数值
 		"MP": 0         #初始数值
 	}
+	return 模板
