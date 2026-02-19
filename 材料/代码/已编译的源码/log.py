@@ -1,8 +1,14 @@
+# 众生之门 - 罗小黑战记非官方同人开源项目
+# 原作IP：寒木春华动画工作室 / MTJJ
+# 本项目非官方授权，仅用于非商业学习交流
 import argparse
 import os
 import time
 
-import file_path
+try:
+	from file_path import log as log_path
+except Exception:
+	log_path = "./log"
 
 parser = argparse.ArgumentParser()
 list1 = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
@@ -39,7 +45,7 @@ def log(head: str, message, error_level=3):
 	global list1
 	# 核心修复1：把文件路径拼接、目录创建逻辑移到函数内，每次调用都校验
 	# 1. 拼接当日日志文件路径（确保每次调用都是最新日期）
-	log_dir = file_path.log
+	log_dir = log_path
 	log_filename = f"{time.strftime('%Y-%m-%d')}.log"
 	log_file = os.path.join(log_dir, log_filename)
 	
