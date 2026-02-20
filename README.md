@@ -23,7 +23,7 @@
 
 ---
 
-### 众生之门开发进度
+### 众生之门开发
 <img src="https://raw.githubusercontent.com/crazying-dev/other/main/%E5%85%8D%E8%B4%A3%E5%A3%B0%E6%98%8E.png" alt="免责声明" style="width:1px;height:auto;border-radius:8px;">
 
 ---
