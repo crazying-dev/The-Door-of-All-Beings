@@ -15,7 +15,7 @@
 [![Issues](https://img.shields.io/github/issues/crazying-dev/The-Door-of-All-Beings?style=flat&label=Issues&labelColor=444444&color=1F883D)](https://github.com/crazying-dev/The-Door-of-All-Beings/issues)
 [![动态-BiliBili](https://img.shields.io/badge/动态-BiliBili-00A4DB?style=flat&logo=bilibili&labelColor=444444&logoColor=white&logoSize=auto)](https://space.bilibili.com/3546900892486452)
 [![动态-小红书](https://img.shields.io/badge/动态-小红书-E4405F?style=flat&logo=xiaohongshu&labelColor=444444&logoColor=white&logoSize=auto)](https://www.xiaohongshu.com/user/profile/682d321b000000000a03c93b)
-[![打赏](https://img.shields.io/badge/-创作支持-946ce6?logo=wechat&style=flat&labelColor=444444&logoSize=auto)](./ReadExplor/募捐.md)
+[![打赏](https://img.shields.io/badge/-创作支持-946ce6?logo=wechat&style=flat&labelColor=444444&logoSize=auto)](https://raw.githubusercontent.com/crazying-dev/other/main/%E5%8B%9F%E6%8D%90.md)
 
 ---
 
@@ -52,7 +52,7 @@
 
 ### 问题反馈与联系
 如果发现仓库内容有误或有其他问题，请通过以下方式联系：  
-[联系方式](./ReadExplor/联系方式.md)
+[联系方式](https://raw.githubusercontent.com/crazying-dev/other/main/%E8%81%94%E7%B3%BB%E6%96%B9%E5%BC%8F.md)
 
 ---
 
@@ -62,7 +62,7 @@
 ---
 
 ### 特别鸣谢
-（人员列表可能不完整，如有遗漏请通过[联系方式](./ReadExplor/联系方式.md)告知）
+（人员列表可能不完整，如有遗漏请通过[联系方式](https://raw.githubusercontent.com/crazying-dev/other/main/%E8%81%94%E7%B3%BB%E6%96%B9%E5%BC%8F.md)告知）
 - 小红书号：`atbbage`
 - 小红书号：`6289561278`
 
@@ -70,4 +70,4 @@
 
 ### 非商业说明
 > 本项目无任何商业性质，「募捐/打赏」仅为粉丝自愿的创作支持，不与项目使用挂钩，且所有收入仅用于项目相关的学习资源购买，不涉及《罗小黑战记》IP的商业利用。  
-[![打赏](https://img.shields.io/badge/-创作支持-946ce6?logo=wechat&style=flat&labelColor=444444&logoSize=auto)](./ReadExplor/募捐.md)
+[![打赏](https://img.shields.io/badge/-创作支持-946ce6?logo=wechat&style=flat&labelColor=444444&logoSize=auto)](https://raw.githubusercontent.com/crazying-dev/other/main/%E5%8B%9F%E6%8D%90.md)
