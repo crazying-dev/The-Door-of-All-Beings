@@ -1,0 +1,103 @@
+[gd_scene format=3 uid="uid://cgby7xghknab0"]
+
+[ext_resource type="FontFile" uid="uid://cnuj13qgsulnj" path="res://font/KNMaiyuan-Regular.ttf" id="1_a202f"]
+[ext_resource type="Script" uid="uid://ckmx5dd48r565" path="res://StartCreen.gd" id="2_r3fl7"]
+[ext_resource type="Texture2D" uid="uid://bjvuhfcn2irew" path="res://icons/-1.png" id="3_a0tk4"]
+[ext_resource type="Script" uid="uid://crdogypawrbfx" path="res://userDOM.gd" id="3_r3fl7"]
+
+[sub_resource type="LabelSettings" id="LabelSettings_bhunq"]
+font = ExtResource("1_a202f")
+font_size = 120
+
+[sub_resource type="LabelSettings" id="LabelSettings_riqys"]
+font = ExtResource("1_a202f")
+font_size = 60
+
+[sub_resource type="LabelSettings" id="LabelSettings_sn0t7"]
+font = ExtResource("1_a202f")
+font_size = 60
+
+[node name="StartCreen" type="Control" unique_id=1683687869]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_top = -7.0
+offset_bottom = -7.0
+grow_horizontal = 2
+grow_vertical = 2
+script = ExtResource("2_r3fl7")
+
+[node name="Background" type="ColorRect" parent="." unique_id=1357644886]
+layout_mode = 0
+offset_right = 2000.0
+offset_bottom = 1000.0
+color = Color(0, 0, 0, 1)
+
+[node name="StartCreenWithText" type="Label" parent="." unique_id=38727277]
+layout_mode = 0
+offset_left = 354.0
+offset_top = 115.0
+offset_right = 786.0
+offset_bottom = 232.0
+text = "众生之门"
+label_settings = SubResource("LabelSettings_bhunq")
+
+[node name="StartCreenProjectDescription" type="Label" parent="." unique_id=2063355405]
+layout_mode = 0
+offset_left = -252.0
+offset_top = 93.0
+offset_right = 1458.0
+offset_bottom = 390.0
+text = "本项目仅为有关罗小黑战记的同人二创项目
+	遵循 BSD 3-Clause 开源许可证
+	未经授权禁止商用"
+label_settings = SubResource("LabelSettings_riqys")
+
+[node name="StartAnimationLoadProgressBar" type="ProgressBar" parent="." unique_id=799978692]
+layout_mode = 0
+offset_left = 9.0
+offset_top = 611.0
+offset_right = 1138.0
+offset_bottom = 638.0
+
+[node name="StartAnimation" type="TextureRect" parent="." unique_id=2121908552]
+layout_mode = 0
+offset_left = 258.0
+offset_top = 106.0
+offset_right = 298.0
+offset_bottom = 146.0
+pivot_offset = Vector2(574, -229)
+
+[node name="User" type="Control" parent="." unique_id=1123325139]
+anchors_preset = 0
+offset_right = 40.0
+offset_bottom = 40.0
+script = ExtResource("3_r3fl7")
+
+[node name="Background" type="TextureRect" parent="User" unique_id=419273956]
+layout_mode = 0
+offset_left = 296.0
+offset_top = 61.0
+offset_right = 1296.0
+offset_bottom = 1047.0
+scale = Vector2(0.5, 0.5)
+texture = ExtResource("3_a0tk4")
+
+[node name="IDL" type="Label" parent="User" unique_id=696741643]
+layout_mode = 0
+offset_left = 310.0
+offset_top = 272.0
+offset_right = 373.0
+offset_bottom = 393.0
+text = "ID
+"
+label_settings = SubResource("LabelSettings_sn0t7")
+
+[node name="UserNameInput" type="LineEdit" parent="User" unique_id=1218158461]
+layout_mode = 0
+offset_left = 400.0
+offset_top = 262.0
+offset_right = 468.5
+offset_bottom = 293.0
+scale = Vector2(5.3157487, 2.5337617)
