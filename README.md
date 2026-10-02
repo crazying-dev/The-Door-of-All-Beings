@@ -28,6 +28,20 @@
 
 ---
 
+### 账号服务（开发说明）
+
+启动页的登录逻辑在 [code/StartCreen/](./code/StartCreen/)，服务端在同一个仓库的 `Server` 分支（Flask + PostgreSQL）。
+
+- 账号服务地址：`https://the-door-of-bings.yjlt.top`，接口前缀 `/api/v1`
+- 本地联调可用环境变量 `TDOB_API_BASE` 覆盖服务地址
+- 设备锁规则：设备标识由服务端签发；**一个设备只能绑定一个账号**，账号一旦绑定就不能更换、也不能换设备登录（客户端与服务端双重校验）
+- 本地文件（`user://`）：
+  - `InstallationUniqueID.bin`：服务端签发的设备标识
+  - `load.bin`：账号信息（`UserName` / `UserID`，形如 `ZWME-2WKQ`）
+- 接口：`GET /api/v1/health`、`POST /api/v1/device`、`POST /api/v1/register`、`POST /api/v1/verify`
+
+---
+
 ### 问题反馈与联系
 如果发现仓库内容有误或有其他问题，请通过以下方式联系：  
 [联系方式](https://crazying-dev.top)

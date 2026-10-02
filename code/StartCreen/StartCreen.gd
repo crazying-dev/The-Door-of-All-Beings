@@ -16,15 +16,8 @@ const StartAnimationZ = 95
 const StartAnimationFatherPath = "res://icons/TDOB/"
 var StartAnimationList = []
 
-func ToolModulateATo0(Body):
-	for i in range(1, 0, -0.001):
-		Body.modulate.a = i
-		await get_tree().process_frame
-
-func ToolModulateATo1(Body):
-	for i in range(0, 1, 0.001):
-		Body.modulate.a = i
-		await get_tree().process_frame
+## 启动动画所需的 95 张 PNG 是否已全部载入完成。
+var StartAnimationLoaded = false
 
 func loadStartAnimation() -> void:
 	StartAnimationLoadProgressBar.min_value = 0
@@ -38,11 +31,12 @@ func loadStartAnimation() -> void:
 		await get_tree().process_frame
 		await get_tree().process_frame
 		StartAnimationLoadProgressBar.value = i
+	StartAnimationLoaded = true
 
 func ChangeStartCreenWithText():
 	await get_tree().create_timer(1.0).timeout
 	StartCreenWithTextDom.hide()
-	
+
 	StartCreenProjectDescription.show()
 	StartCreenProjectDescription.horizontal_alignment = 1
 	await get_tree().create_timer(2.0).timeout
@@ -70,6 +64,9 @@ func loadingUser():
 func _ready() -> void:
 	loadStartAnimation()
 	await ChangeStartCreenWithText()
+	# 等 95 张动画帧全部载入（旧版本这里没等，会数组越界）。
+	while not StartAnimationLoaded:
+		await get_tree().process_frame
 	await RunStartAnimation()
 	await loadingUser()
 
