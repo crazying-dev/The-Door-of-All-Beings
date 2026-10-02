@@ -7,6 +7,8 @@ extends Control
 @onready var Background: ColorRect = $Background
 @onready var User: Control = $User
 
+@onready var next: PackedScene = preload("res://Scenes/start/race.tscn")
+
 signal StartLoadUser()
 
 var z = 0 # 计数器-帧数
@@ -62,7 +64,6 @@ func RunStartAnimation():
 	StartAnimation.hide()
 
 func loadingUser():
-	User.show()
 	emit_signal("StartLoadUser")
 
 # Called when the node enters the scene tree for the first time.
@@ -76,3 +77,6 @@ func _ready() -> void:
 # Called every frame. 'delta' is the elapsed time since the previous frame.
 func _process(delta: float) -> void:
 	z += 1
+
+func gotonexttscn():
+	get_tree().change_scene_to_packed(next)

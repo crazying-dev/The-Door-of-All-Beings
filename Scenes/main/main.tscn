@@ -1,0 +1,25 @@
+[gd_scene format=3 uid="uid://blxjtqjxe6irn"]
+
+[ext_resource type="Script" uid="uid://c6x213fsmyc7b" path="res://main.gd" id="1_ig7tw"]
+[ext_resource type="PackedScene" uid="uid://d1cim64gp2gl6" path="res://obj/未命名.glb" id="2_w1fgp"]
+
+[node name="Main" type="Node3D" unique_id=738269047]
+transform = Transform3D(0.88103485, 0, -0.47305134, 0, 1, 0, 0.47305134, 0, 0.88103485, 0, 0, 0)
+script = ExtResource("1_ig7tw")
+
+[node name="Camera3D" type="Camera3D" parent="." unique_id=210298898]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 16.679382, 283.74524, 373.91687)
+
+[node name="未命名2" parent="." unique_id=155533787 instance=ExtResource("2_w1fgp")]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 212.06195, 0)
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=1542069715]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 235.10767, 0)
+layers = 1048575
+light_energy = 16.0
+light_indirect_energy = 16.0
+light_volumetric_fog_energy = 16.0
+light_angular_distance = 90.0
+light_negative = true
+light_specular = 16.0
+directional_shadow_blend_splits = true
