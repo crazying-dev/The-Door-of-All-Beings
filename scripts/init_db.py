@@ -1,6 +1,6 @@
 """建表脚本（幂等）。
 
-用法：uv run python scripts/init_db.py
+用法：uv run scripts/init_db.py（uv 会自动建 .venv 并安装依赖）
 """
 
 from __future__ import annotations

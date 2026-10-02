@@ -28,6 +28,8 @@ The-Door-Of-Bings-Server/
 ├── wsgi.py                  # 生产环境 WSGI 入口（waitress）
 ├── schema.sql               # 表结构（幂等，可重复执行）
 ├── pyproject.toml
+├── uv.lock                  # 依赖锁定文件（入库，保证各机器安装一致）
+├── .python-version          # 固定 Python 3.12（uv 缺则自动下载）
 ├── .env.example             # 配置模板（.env 不入库）
 ├── app/
 │   ├── __init__.py          # Flask 应用工厂 + 统一错误处理
@@ -47,26 +49,62 @@ The-Door-Of-Bings-Server/
 
 ## 快速开始
 
-```bash
-# 1. 安装依赖（uv 会创建 .venv 并生成 uv.lock）
-uv sync
+前置条件只有一条：**装好 [uv](https://docs.astral.sh/uv/)**。
 
-# 2. 配置连接串（.env 已在 .gitignore 中）
-cp .env.example .env
+```bash
+# Linux / macOS
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+```powershell
+# Windows（PowerShell）
+powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+之后**不需要 `uv venv`、不需要 `pip install`、不需要手动激活虚拟环境**，一条 `uv run` 就把环境和依赖准备好并直接执行脚本：
+
+```bash
+# ① 配置连接串（.env 已在 .gitignore 中，不会入库）
+cp .env.example .env          # Windows: copy .env.example .env
 #   编辑 .env，填入 DATABASE_URL
 
-# 3. 建表（幂等）
-uv run python scripts/init_db.py
+# ② 建表（幂等）—— 首次运行会自动创建 .venv 并安装依赖
+uv run scripts/init_db.py
 
-# 4a. 开发运行
-uv run python main.py
+# ③ 开发运行（Flask 内置服务器）
+uv run main.py
 
-# 4b. 生产运行
+# ④ 生产运行（waitress）
 uv run waitress-serve --host 127.0.0.1 --port 2690 wsgi:app
 
-# 5. 端到端自测（需服务已启动）
-uv run python scripts/smoke_test.py
+# ⑤ 端到端自测（需 ③ 或 ④ 已启动）
+uv run scripts/smoke_test.py
 ```
+
+### 一条 `uv run` 背后发生了什么
+
+| 步骤 | uv 自动完成 |
+|---|---|
+| 1 | 读 `.python-version` → 本机没有 Python 3.12 时**自动下载**一份到 uv 的托管目录 |
+| 2 | 在项目根创建 `.venv`（可用环境变量 `UV_PROJECT_ENVIRONMENT` 改路径） |
+| 3 | 按 `uv.lock` 精确安装 flask / psycopg2-binary / python-dotenv / waitress，并自动同步 |
+| 4 | 用该环境执行你传入的脚本或命令 |
+
+所以一个刚克隆下来的仓库是**零准备可运行**的。
+
+### 常用命令对照
+
+| 目的 | 命令 |
+|---|---|
+| 建/更新环境与依赖（隐式） | `uv run main.py` |
+| 显式同步环境 | `uv sync` |
+| 按锁文件精确安装（CI / 部署） | `uv sync --frozen` |
+| 校验锁文件是否与 `pyproject.toml` 一致 | `uv lock --check` |
+| 临时跑一段 Python | `uv run python -c "import flask; print(flask.__version__)"` |
+| 不改锁文件地运行（部署/离线） | `uv run --frozen --no-sync main.py` |
+
+> 为什么没有 `uv run serve` 这类命令别名？本项目是扁平结构的**应用**而非库（`package = false`），
+> uv 的入口点表 `[project.scripts]` 只在项目被构建安装后才生效，所以约定直接用脚本路径运行。
 
 ---
 
@@ -172,11 +210,15 @@ CREATE TABLE accounts (
 1. 拉取代码到服务器（例如 `/root/The-Door-Of-Bings-Server`，即 `Server` 分支的 worktree 所在目录）：
 
    ```bash
+   # 若服务器还没有 uv
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+
    git clone -b Server https://github.com/crazying-dev/The-Door-of-All-Beings.git /root/The-Door-Of-Bings-Server
    cd /root/The-Door-of-Bings-Server
-   uv sync --frozen
+
+   uv sync --frozen                    # 按 uv.lock 精确安装（不改锁文件）
    cp .env.example .env && vi .env      # 填 DATABASE_URL
-   uv run python scripts/init_db.py
+   uv run --frozen scripts/init_db.py   # 建表（幂等）
    ```
 
 2. 用 systemd 守护（或用 tmux，与 forum 的部署习惯保持一致）：

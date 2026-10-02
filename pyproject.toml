@@ -11,6 +11,8 @@ dependencies = [
     "waitress>=3.0.0",
 ]
 
-# 本项目是应用而非库：不要让 uv 尝试构建包
+# 本项目是应用而非库：不要让 uv 尝试构建包。
+# 注意：因此不能用 [project.scripts] 提供命令别名（uv 的入口点表要求项目被构建并安装）；
+# 一键运行请直接传脚本路径，例如 `uv run main.py`、`uv run scripts/init_db.py`。
 [tool.uv]
 package = false

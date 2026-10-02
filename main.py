@@ -1,5 +1,8 @@
 """众生之门 服务端入口（开发用：flask 自带服务器）。
 
+运行（首次会自动创建 .venv 并安装依赖，无需 uv sync）：
+    uv run main.py
+
 生产建议用 waitress：
     uv run waitress-serve --host 127.0.0.1 --port 2690 wsgi:app
 """

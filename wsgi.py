@@ -1,4 +1,8 @@
-"""WSGI 入口：waitress-serve --call 或 wsgi:app 使用。"""
+"""WSGI 入口：waitress-serve --call 或 wsgi:app 使用。
+
+运行（uv 会自动创建 .venv 并安装依赖）：
+    uv run waitress-serve --host 127.0.0.1 --port 2690 wsgi:app
+"""
 
 from __future__ import annotations
 

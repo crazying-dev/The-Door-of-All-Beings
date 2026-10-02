@@ -1,7 +1,7 @@
 """端到端冒烟测试：对本机服务依次调用 4 个接口，验证设备锁语义。
 
 用法：
-    uv run python scripts/smoke_test.py [base_url]
+    uv run scripts/smoke_test.py [base_url]
 默认 base_url = http://127.0.0.1:2690
 
 测试会在真实数据库里创建临时记录，结束后自动删除。
