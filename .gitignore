@@ -1,0 +1,12 @@
+# 本地环境
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# 机密：数据库连接串绝不入库
+.env
+
+# 运行产物
+*.log
+tmp/

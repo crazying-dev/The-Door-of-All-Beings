@@ -1,0 +1,24 @@
+# 众生之门 账号服务 —— systemd 单元模板
+# 使用：cp 到 /etc/systemd/system/the-door-of-bings.service
+#       systemctl daemon-reload && systemctl enable --now the-door-of-bings
+
+[Unit]
+Description=The Door of All Beings - account/device binding service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=<WORKDIR>
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONIOENCODING=utf-8
+# 若 uv 不在 PATH 中，改成绝对路径，例如 /root/.local/bin/uv
+ExecStart=/usr/bin/env uv run --no-sync waitress-serve --host 127.0.0.1 --port 2690 wsgi:app
+Restart=always
+RestartSec=3
+StandardOutput=append:/var/log/the-door-of-bings.log
+StandardError=append:/var/log/the-door-of-bings.log
+
+[Install]
+WantedBy=multi-user.target
