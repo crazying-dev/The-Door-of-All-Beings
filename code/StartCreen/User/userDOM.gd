@@ -7,6 +7,9 @@ extends Control
 ##   2. 首次登录：POST /api/v1/register
 ##   3. 再次登录：POST /api/v1/verify（服务端重新校验 设备 + 用户 ID + 名称 三者一致）
 ##   4. 用 EndLoadUser(UserIsLoaded) 通知确认面板显示 / 隐藏
+##   5. 本机已有登录凭证（本地账号文件 / 服务端找回）：跳过 Yes/No 确认，直接进入下一个场景
+##      —— 即使凭证已失效、服务端校验不通过，也照样放行；
+##      确认面板只服务于「本次启动内新注册」的成功恭喜页。
 ##
 ## 场景里已经连好的信号（StartCreen.tscn L2008-L2012，不可改动）：
 ##   StartLoadUser()                              根节点在启动动画结束后发出
@@ -47,6 +50,10 @@ var _account: Dictionary = {}
 var _boot_done := false
 var _started := false
 var _working := false
+## 本次启动前本机已有登录凭证（本地账号文件 / 从服务端找回）：不再弹 Yes/No 确认。
+var _resumed := false
+## 防止重复触发「进入下一个场景」。
+var _next_requested := false
 
 
 func _ready() -> void:
@@ -62,7 +69,11 @@ func _ready() -> void:
 ## 申请设备标识 -> 读本地账号 -> 有账号则校验。全程不改界面可见性，
 ## 真正的显示 / 隐藏交给 StartLoadUser（启动动画结束后）。
 func _bootstrap() -> void:
-	if not await _ensure_device():
+	var device_ok := await _ensure_device()
+	# 只要本机已有登录凭证（本地文件，或刚刚由服务端找回）就不再弹确认面板，
+	# 与校验结果无关；只有「本次启动内新注册」才需要用户点一次 Yes。
+	_resumed = not AccountStore.read_account().is_empty()
+	if not device_ok:
 		_state = "error"
 	else:
 		_account = AccountStore.read_account()
@@ -183,8 +194,16 @@ func GETUserName(text: String = "") -> void:
 
 func _apply_start() -> void:
 	waiteLabel.text = _message
+	if _resumed:
+		# 本机已有登录凭证：本次启动一律不弹 Yes/No 确认，直接进入下一个场景。
+		# 凭证已失效 / 校验不通过 / 网络不通都照样放行（按用户要求）。
+		UserIsLoad = true
+		hide()
+		_goto_next()
+		return
 	match _state:
 		"logged_in":
+			# 本次启动内刚注册成功：让确认面板显示一次。
 			UserIsLoad = true
 			hide()
 			emit_signal("EndLoadUser", true)
@@ -205,6 +224,20 @@ func _show_input(editable: bool) -> void:
 	show()
 	if editable:
 		input.grab_focus()
+
+
+## 跳过确认面板，直接进入下一个场景。
+## 复用场景里已经连好的 LoadUserOK -> 根节点 gotonexttscn() 通路，
+## 避免在脚本里重复硬编码下一场景的路径。
+func _goto_next() -> void:
+	if _next_requested:
+		return
+	_next_requested = true
+	var panel := get_node_or_null("../UserLoaded")
+	if panel != null and panel.has_method("LoadOK"):
+		panel.call("LoadOK")
+	else:
+		get_parent().call("gotonexttscn")
 
 
 # ================================================================ 注册 / 找回
