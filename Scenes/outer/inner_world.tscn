@@ -1,0 +1,41 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://code/outer/inner_world.gd" id="1_script"]
+
+[sub_resource type="PlaneMesh" id="PlaneMesh_floor"]
+size = Vector2(400, 400)
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_floor"]
+albedo_color = Color(0.44, 0.47, 0.52, 1)
+roughness = 0.95
+
+[sub_resource type="BoxShape3D" id="BoxShape3D_floor"]
+size = Vector3(400, 2, 400)
+
+[node name="InnerWorld" type="Node3D"]
+script = ExtResource("1_script")
+
+[node name="SunLight" type="DirectionalLight3D" parent="."]
+rotation_degrees = Vector3(-55, -120, 0)
+light_color = Color(1, 0.95, 0.84, 1)
+light_energy = 1.1
+shadow_enabled = true
+directional_shadow_max_distance = 250.0
+
+[node name="Floor" type="MeshInstance3D" parent="."]
+cast_shadow = 0
+mesh = SubResource("PlaneMesh_floor")
+material_override = SubResource("StandardMaterial3D_floor")
+
+[node name="FloorBody" type="StaticBody3D" parent="."]
+collision_layer = 1
+collision_mask = 0
+
+[node name="Collision" type="CollisionShape3D" parent="FloorBody"]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -1, 0)
+shape = SubResource("BoxShape3D_floor")
+
+[node name="Spawn" type="Node3D" parent="."]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0.1, 0)
+
+[node name="Decoration" type="Node3D" parent="."]

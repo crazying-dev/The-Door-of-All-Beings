@@ -1,0 +1,55 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://code/outer/light_pillar.gd" id="1_pillar"]
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_dust"]
+transparency = 1
+blend_mode = 1
+shading_mode = 0
+vertex_color_use_as_albedo = true
+albedo_color = Color(0.3, 0.42, 0.62, 1)
+use_particle_trails = true
+
+[sub_resource type="ParticleProcessMaterial" id="ParticleProcessMaterial_dust"]
+emission_shape = 3
+emission_box_extents = Vector3(0.99, 1.2, 0.99)
+direction = Vector3(0, 1, 0)
+spread = 0.2
+initial_velocity_min = 7.0
+initial_velocity_max = 20.0
+gravity = Vector3(0, 0.15, 0)
+scale_min = 0.75
+scale_max = 1.25
+
+[sub_resource type="RibbonTrailMesh" id="RibbonTrailMesh_dust"]
+material = SubResource("StandardMaterial3D_dust")
+size = 0.14
+sections = 12
+section_length = 0.5
+
+[sub_resource type="CylinderShape3D" id="CylinderShape3D_gate"]
+height = 8.0
+radius = 8.5
+
+[node name="LightPillar" type="Node3D" unique_id=793427811]
+script = ExtResource("1_pillar")
+
+[node name="Dust" type="GPUParticles3D" parent="." unique_id=1293105289]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, -300, 0)
+material_override = SubResource("StandardMaterial3D_dust")
+cast_shadow = 0
+amount = 3000
+lifetime = 115.218
+preprocess = 115.218
+trail_enabled = true
+trail_lifetime = 0.45
+visibility_aabb = AABB(-16.4, -304, -16.4, 32.8, 3312, 32.8)
+process_material = SubResource("ParticleProcessMaterial_dust")
+draw_pass_1 = SubResource("RibbonTrailMesh_dust")
+
+[node name="Gate" type="Area3D" parent="." unique_id=921895061]
+collision_layer = 0
+
+[node name="Shape" type="CollisionShape3D" parent="Gate" unique_id=544905839]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 4, 0)
+shape = SubResource("CylinderShape3D_gate")
