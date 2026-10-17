@@ -1,0 +1,172 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://code/outer/world.gd" id="1_main"]
+[ext_resource type="PackedScene" path="res://Scenes/outer/outer_world.tscn" id="2_outer"]
+[ext_resource type="PackedScene" path="res://Scenes/outer/inner_world.tscn" id="3_inner"]
+[ext_resource type="PackedScene" path="res://Scenes/outer/player.tscn" id="4_player"]
+[ext_resource type="Script" path="res://code/outer/hud.gd" id="5_hud"]
+[ext_resource type="Shader" path="res://shaders/white_wipe.gdshader" id="6_wipe"]
+[ext_resource type="Shader" path="res://shaders/void_sky.gdshader" id="7_sky"]
+
+[sub_resource type="ShaderMaterial" id="ShaderMaterial_outer_sky"]
+shader = ExtResource("7_sky")
+shader_parameter/bottom_color = Color(0, 0, 0, 1)
+shader_parameter/top_color = Color(0.36, 0.38, 0.42, 1)
+shader_parameter/fade_height = 1.0
+shader_parameter/fade_below = 0.3
+shader_parameter/dither_amount = 1.0
+
+[sub_resource type="Sky" id="Sky_outer"]
+sky_material = SubResource("ShaderMaterial_outer_sky")
+
+[sub_resource type="Environment" id="Environment_outer"]
+background_mode = 2
+sky = SubResource("Sky_outer")
+ambient_light_source = 1
+reflected_light_source = 1
+tonemap_mode = 2
+glow_enabled = true
+glow_intensity = 1.1
+glow_bloom = 0.25
+glow_hdr_threshold = 0.85
+
+[sub_resource type="Environment" id="Environment_inner"]
+background_mode = 1
+background_color = Color(0.52, 0.62, 0.78, 1)
+ambient_light_source = 2
+ambient_light_color = Color(0.62, 0.7, 0.85, 1)
+ambient_light_energy = 1.1
+reflected_light_source = 1
+tonemap_mode = 2
+glow_enabled = true
+glow_intensity = 0.6
+glow_bloom = 0.1
+fog_enabled = true
+fog_light_color = Color(0.62, 0.72, 0.88, 1)
+fog_light_energy = 0.7
+fog_density = 0.006
+fog_aerial_perspective = 0.4
+
+[sub_resource type="SystemFont" id="SystemFont_ui"]
+font_names = PackedStringArray("Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", "sans-serif")
+
+[sub_resource type="ShaderMaterial" id="ShaderMaterial_wipe"]
+shader = ExtResource("6_wipe")
+shader_parameter/wipe_color = Color(1, 1, 1, 1)
+shader_parameter/progress = 0.0
+shader_parameter/softness = 0.42
+shader_parameter/fade = 0.0
+shader_parameter/aspect = 1.77778
+
+[node name="World" type="Node3D"]
+script = ExtResource("1_main")
+outer_environment = SubResource("Environment_outer")
+inner_environment = SubResource("Environment_inner")
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("Environment_outer")
+
+[node name="Worlds" type="Node3D" parent="."]
+
+[node name="OuterWorld" parent="Worlds" instance=ExtResource("2_outer")]
+
+[node name="InnerWorld" parent="Worlds" instance=ExtResource("3_inner")]
+position = Vector3(0, 0, 6000)
+
+[node name="Player" parent="." instance=ExtResource("4_player")]
+position = Vector3(0, 0.1, 16)
+
+[node name="HUD" type="CanvasLayer" parent="."]
+script = ExtResource("5_hud")
+
+[node name="WorldLabel" type="Label" parent="HUD"]
+anchors_preset = 12
+anchor_top = 1.0
+anchor_right = 1.0
+anchor_bottom = 1.0
+offset_top = -104.0
+offset_bottom = -44.0
+grow_horizontal = 2
+grow_vertical = 0
+mouse_filter = 2
+theme_override_colors/font_color = Color(0.74, 0.94, 1, 0.94)
+theme_override_colors/font_outline_color = Color(0, 0.06, 0.12, 1)
+theme_override_constants/outline_size = 8
+theme_override_fonts/font = SubResource("SystemFont_ui")
+theme_override_font_sizes/font_size = 34
+text = "门外的虚空"
+horizontal_alignment = 1
+vertical_alignment = 1
+
+[node name="HintLabel" type="Label" parent="HUD"]
+anchors_preset = 5
+anchor_left = 0.5
+anchor_right = 0.5
+offset_left = -520.0
+offset_top = 34.0
+offset_right = 520.0
+offset_bottom = 66.0
+grow_horizontal = 2
+mouse_filter = 2
+theme_override_colors/font_color = Color(0.8, 0.9, 1, 0.78)
+theme_override_colors/font_outline_color = Color(0, 0.05, 0.1, 1)
+theme_override_constants/outline_size = 6
+theme_override_fonts/font = SubResource("SystemFont_ui")
+theme_override_font_sizes/font_size = 18
+horizontal_alignment = 1
+vertical_alignment = 1
+
+[node name="InfoPanel" type="PanelContainer" parent="HUD"]
+offset_left = 22.0
+offset_top = 20.0
+offset_right = 430.0
+offset_bottom = 124.0
+mouse_filter = 2
+
+[node name="VBox" type="VBoxContainer" parent="HUD/InfoPanel"]
+layout_mode = 2
+mouse_filter = 2
+theme_override_constants/separation = 4
+
+[node name="Title" type="Label" parent="HUD/InfoPanel/VBox"]
+layout_mode = 2
+mouse_filter = 2
+theme_override_colors/font_color = Color(0.7, 0.92, 1, 0.95)
+theme_override_fonts/font = SubResource("SystemFont_ui")
+theme_override_font_sizes/font_size = 17
+text = "众生之门 · 第一人称（同人复刻）"
+
+[node name="Help" type="Label" parent="HUD/InfoPanel/VBox"]
+layout_mode = 2
+mouse_filter = 2
+theme_override_colors/font_color = Color(0.76, 0.86, 0.96, 0.72)
+theme_override_fonts/font = SubResource("SystemFont_ui")
+theme_override_font_sizes/font_size = 14
+text = "非官方同人 · 仅供学习交流 · 非商业用途"
+
+[node name="Speed" type="Label" parent="HUD/InfoPanel/VBox"]
+layout_mode = 2
+mouse_filter = 2
+theme_override_colors/font_color = Color(0.76, 0.86, 0.96, 0.72)
+theme_override_fonts/font = SubResource("SystemFont_ui")
+theme_override_font_sizes/font_size = 14
+text = "速度 0.0 m/s"
+
+[node name="Flash" type="ColorRect" parent="HUD"]
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+color = Color(1, 1, 1, 0)
+
+[node name="Wipe" type="ColorRect" parent="HUD"]
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+material = SubResource("ShaderMaterial_wipe")
+color = Color(1, 1, 1, 1)

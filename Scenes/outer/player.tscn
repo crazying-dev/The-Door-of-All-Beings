@@ -1,0 +1,25 @@
+[gd_scene format=3]
+
+[ext_resource type="Script" path="res://code/outer/player_fp.gd" id="1_player"]
+
+[sub_resource type="CapsuleShape3D" id="CapsuleShape3D_body"]
+radius = 0.4
+height = 1.8
+
+[node name="Player" type="CharacterBody3D"]
+collision_layer = 1
+collision_mask = 1
+floor_snap_length = 0.3
+script = ExtResource("1_player")
+
+[node name="Collision" type="CollisionShape3D" parent="."]
+position = Vector3(0, 0.9, 0)
+shape = SubResource("CapsuleShape3D_body")
+
+[node name="Head" type="Node3D" parent="."]
+position = Vector3(0, 1.65, 0)
+
+[node name="Camera" type="Camera3D" parent="Head"]
+fov = 76.0
+near = 0.05
+far = 1500.0
