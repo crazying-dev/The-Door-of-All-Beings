@@ -1,19 +1,31 @@
 extends CanvasLayer
-## 平视显示：穿界白光（由远及近的擦除）、当前世界名、操作提示、速度读数。
+## 平视显示：穿界白光（由远及近的擦除）、按 H 显示的按键说明、按 F3 显示的调试面板。
 ## 全部节点的 mouse_filter 都是 IGNORE，绝不抢鼠标事件（否则鼠标视角会被面板吃掉）。
+##
+## 默认状态是一块干净的画面，没有任何常驻文字：
+##   F3 —— 显示 / 隐藏左上角调试面板（速度、坐标、朝向）
+##   H  —— 显示 / 隐藏顶部按键说明
 ##
 ## 这层上有两块白：
 ##   Flash —— 传统的整体白闪（现在是按 R 复位时闪一下）；
 ##   Wipe  —— 穿界过场：用 white_wipe.gdshader 让白色从画面中心向四周铺开。
 
+## 八个方位名，从正北开始顺时针。正北 = -Z。
+const COMPASS_NAMES := ["北", "东北", "东", "东南", "南", "西南", "西", "西北"]
+
 @onready var _flash: ColorRect = $Flash
 @onready var _wipe: ColorRect = $Wipe
-@onready var _world_label: Label = $WorldLabel
 @onready var _hint: Label = $HintLabel
+@onready var _info_panel: PanelContainer = $InfoPanel
 @onready var _speed_label: Label = $InfoPanel/VBox/Speed
+@onready var _coords_label: Label = $InfoPanel/VBox/Coords
+@onready var _facing_label: Label = $InfoPanel/VBox/Facing
 
 var _flash_tween: Tween
 var _wipe_material: ShaderMaterial
+## 按键说明的正文与显隐开关分开存：H 只切开关，不会把文本丢掉。
+var _hint_text := ""
+var _hint_shown := false
 
 
 func _ready() -> void:
@@ -21,22 +33,56 @@ func _ready() -> void:
 	_wipe_material = _wipe.material as ShaderMaterial
 	set_wipe_progress(0.0)
 	set_wipe_fade(0.0)
+	# 开场什么都不显示：调试面板与按键说明都先藏起来。
+	_info_panel.visible = false
+	_hint_shown = false
+	_apply_hint()
 
 
-## 底部大字：当前所在的世界。
-func set_world_name(text: String) -> void:
-	_world_label.text = text
+func _unhandled_input(event: InputEvent) -> void:
+	if event.is_action_pressed("toggle_debug"):
+		_info_panel.visible = not _info_panel.visible
+		get_viewport().set_input_as_handled()
+		return
+	if event.is_action_pressed("toggle_help"):
+		_hint_shown = not _hint_shown
+		_apply_hint()
+		get_viewport().set_input_as_handled()
 
 
-## 顶部提示条：传空字符串就隐藏。
+## 设置按键说明的正文（按 H 才看得到；正文为空则无论如何都隐藏）。
 func set_hint(text: String) -> void:
-	_hint.text = text
-	_hint.visible = text != ""
+	_hint_text = text
+	_apply_hint()
 
 
-## 左上角速度读数（m/s）。
+## 调试面板当前是否可见。外部可据此决定要不要每帧算坐标。
+func is_debug_visible() -> bool:
+	return _info_panel.visible
+
+
+func _apply_hint() -> void:
+	if _hint == null:
+		return
+	_hint.text = _hint_text
+	_hint.visible = _hint_shown and _hint_text != ""
+
+
+## 调试面板：水平速度（m/s）。
 func set_speed(value: float) -> void:
 	_speed_label.text = "速度 %.1f m/s" % value
+
+
+## 调试面板：世界坐标。
+func set_coords(position: Vector3) -> void:
+	_coords_label.text = "坐标 X %.1f   Y %.1f   Z %.1f" % [position.x, position.y, position.z]
+
+
+## 调试面板：面对方向（方位 + 方位角，0° = 正北 = -Z）。
+func set_facing(yaw_degrees: float) -> void:
+	var bearing := fposmod(-yaw_degrees, 360.0)
+	var index := int(floor((bearing + 22.5) / 45.0)) % COMPASS_NAMES.size()
+	_facing_label.text = "朝向 %s（%.0f°）" % [COMPASS_NAMES[index], bearing]
 
 
 ## 穿界白光：progress 从 0 涨到 1.6。
@@ -59,3 +105,4 @@ func flash_white(duration: float = 0.8) -> void:
 	_flash.color = Color(1.0, 1.0, 1.0, 1.0)
 	_flash_tween = create_tween()
 	_flash_tween.tween_property(_flash, "color:a", 0.0, duration)
+

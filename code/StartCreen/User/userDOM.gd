@@ -17,6 +17,8 @@ extends Control
 ##   LoadUserError(bool)                          预留（本版本不再发出）
 
 const AccountStore = preload("res://code/StartCreen/account_store.gd")
+## 统一的信息发送模块：每次请求自动携带客户端版本。
+const RequestClient = preload("res://code/net/request_client.gd")
 
 ## 账号服务默认地址（服务端部署后生效）。
 const API_BASE_DEFAULT := "https://the-door-of-bings.yjlt.top"
@@ -41,8 +43,8 @@ var InstallationUniqueID := ""
 ## 本机是否已有可用账号。
 var UserIsLoad := false
 
-## 场景里只有一个 HTTPRequest 节点，必须串行使用。
-var _http_busy := false
+## 场景里只有一个 HTTPRequest 节点，串行化交给 RequestClient 内部处理。
+var _client: RefCounted = null
 ## 启动阶段确定的状态：unknown / need_name / logged_in / locked / error
 var _state := "unknown"
 var _message := ""
@@ -58,7 +60,7 @@ var _next_requested := false
 
 func _ready() -> void:
 	hide()
-	http.timeout = HTTP_TIMEOUT
+	_client = RequestClient.new(http, HTTP_TIMEOUT)
 	if not OKButton.pressed.is_connected(GETUserName):
 		OKButton.pressed.connect(GETUserName)
 	_bootstrap()
@@ -321,43 +323,11 @@ func _restart() -> void:
 # ================================================================ HTTP
 
 ## 统一请求：返回服务端的 JSON 对象，或 {"ok": false, "code": ..., "msg": ...}。
+## 真正的发送逻辑在 code/net/request_client.gd，由它统一附加客户端版本（请求头 + 请求体）。
 func _request(method: int, path: String, payload: Dictionary) -> Dictionary:
-	while _http_busy:
-		await get_tree().process_frame
-	_http_busy = true
-	var url := API_BASE + API_PREFIX + path
-	var headers := PackedStringArray(["Content-Type: application/json"])
-	var err := OK
-	if method == HTTPClient.METHOD_GET:
-		err = http.request(url, headers, HTTPClient.METHOD_GET)
-	else:
-		err = http.request(url, headers, HTTPClient.METHOD_POST, JSON.stringify(payload))
-	var response: Array = []
-	if err == OK:
-		response = await http.request_completed
-	_http_busy = false
-	if err != OK:
-		return {"ok": false, "code": "REQUEST_FAILED", "msg": "请求发起失败（错误码 %d）" % err}
-	return _decode(response)
-
-
-func _decode(response: Array) -> Dictionary:
-	if response.size() < 4:
-		return {"ok": false, "code": "NETWORK", "msg": "网络请求未完成"}
-	var result: int = response[0]
-	var http_code: int = response[1]
-	var raw: PackedByteArray = response[3]
-	if result != HTTPRequest.RESULT_SUCCESS:
-		return {"ok": false, "code": "NETWORK", "msg": "网络请求失败（结果码 %d）" % result}
-	var parsed: Variant = JSON.parse_string(raw.get_string_from_utf8())
-	if typeof(parsed) != TYPE_DICTIONARY:
-		return {"ok": false, "code": "BAD_RESPONSE", "msg": "服务端返回格式异常（HTTP %d）" % http_code}
-	var data: Dictionary = parsed
-	if not data.has("ok"):
-		data["ok"] = http_code >= 200 and http_code < 300
-	if not data.get("ok", false) and not data.has("code"):
-		data["code"] = "HTTP_%d" % http_code
-	return data
+	if _client == null:
+		_client = RequestClient.new(http, HTTP_TIMEOUT)
+	return await _client.send(method, API_BASE + API_PREFIX + path, payload)
 
 
 func _friendly_error(res: Dictionary, fallback: String) -> String:

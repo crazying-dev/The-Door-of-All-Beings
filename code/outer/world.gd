@@ -9,8 +9,6 @@ extends Node3D
 ## 门内世界目前是「只摆一块地板」的简化版：地形与装饰留到之后再补，
 ## 所以这里只保证「落得下去、站得住、能跑」，其余逻辑与最终版一致。
 
-## 两个世界的名字（下标就是世界索引：0 = 门外，1 = 门内）。
-const WORLD_NAMES := ["门外的虚空", "众生之门 · 门内世界"]
 ## 两个世界的间距（门内世界那个 Node3D 就摆在 z = 6000）。
 ## 门外地板是 4000x4000（z 只到 ±2000），间距取 6000 是留足余量：
 ## 站到门外地板的边缘，也既看不见、也碰不到 6000 米外的门内世界。
@@ -25,7 +23,7 @@ const WIPE_OUT_TIME := 0.75
 ## 门内随机落点的最大半径。半径 30 是「之后那块灵质台」的半径，这里留 8 米余量；
 ## 目前的简化地板远大于 30，所以一定站得住。
 const ARRIVAL_RADIUS := 22.0
-const HINT_TEXT := "WASD 移动   ·   Shift 疾行   ·   空格 跳跃   ·   走近光柱进入门内世界（单向）   ·   Esc 释放鼠标   ·   R 复位"
+const HINT_TEXT := "WASD 移动   ·   Shift 疾行   ·   空格 跳跃   ·   走近光柱进入门内世界（单向）   ·   Esc 释放鼠标   ·   R 复位   ·   F3 调试面板   ·   H 关闭本说明"
 
 ## 万一 project.godot 里的输入动作丢了，运行时补一份，保证一定操作得起来。
 const FALLBACK_ACTIONS := {
@@ -36,6 +34,8 @@ const FALLBACK_ACTIONS := {
 	"jump": [KEY_SPACE],
 	"sprint": [KEY_SHIFT],
 	"reset_player": [KEY_R],
+	"toggle_debug": [KEY_F3],
+	"toggle_help": [KEY_H],
 }
 
 @export_group("环境")
@@ -78,7 +78,6 @@ func _ready() -> void:
 	# 开场只切环境、不挪人：玩家就摆在 world.tscn 里那个正对光柱的起始点。
 	_apply_world(0)
 	_cooldown = 0.0
-	_hud.set_world_name(WORLD_NAMES[0])
 	_hud.set_hint(HINT_TEXT)
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 
@@ -123,8 +122,6 @@ func _start_transition() -> void:
 ## 白到最白的那一刻：换到门内世界，并把人随机丢在落点圆内（朝向也是随机的）。
 func _arrive() -> void:
 	_apply_world(1)
-	if _hud != null:
-		_hud.set_world_name(WORLD_NAMES[1])
 	if _player == null:
 		return
 	var origin := _inner_world.global_position
@@ -150,11 +147,15 @@ func _process(delta: float) -> void:
 	if _player != null and _player.global_position.y < FALL_LIMIT:
 		_respawn()
 
-	# 速度读数每 0.1 秒刷一次就够了，别每帧都拼字符串。
+	# 调试面板的读数每 0.1 秒刷一次就够了，别每帧都拼字符串。
+	# 面板隐藏时干脆不算，省掉无意义的字符串拼接。
 	_speed_accum += delta
 	if _speed_accum >= 0.1 and _hud != null and _player != null:
 		_speed_accum = 0.0
-		_hud.set_speed(_player.get_horizontal_speed())
+		if _hud.is_debug_visible():
+			_hud.set_speed(_player.get_horizontal_speed())
+			_hud.set_coords(_player.global_position)
+			_hud.set_facing(_player.get_yaw_degrees())
 
 
 func _unhandled_input(event: InputEvent) -> void:

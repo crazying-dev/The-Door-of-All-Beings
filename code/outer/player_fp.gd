@@ -83,6 +83,11 @@ func get_horizontal_speed() -> float:
 	return Vector2(velocity.x, velocity.z).length()
 
 
+## 当前朝向角（度）。0 度对应 -Z 方向（= HUD 里的"北"），顺时针为正。
+func get_yaw_degrees() -> float:
+	return rad_to_deg(rotation.y)
+
+
 func _apply_pitch(degrees: float) -> void:
 	_pitch_degrees = clampf(degrees, -pitch_limit_degrees, pitch_limit_degrees)
 	if _head != null:

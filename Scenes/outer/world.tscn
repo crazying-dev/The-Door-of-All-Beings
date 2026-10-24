@@ -79,26 +79,8 @@ position = Vector3(0, 0.1, 16)
 [node name="HUD" type="CanvasLayer" parent="."]
 script = ExtResource("5_hud")
 
-[node name="WorldLabel" type="Label" parent="HUD"]
-anchors_preset = 12
-anchor_top = 1.0
-anchor_right = 1.0
-anchor_bottom = 1.0
-offset_top = -104.0
-offset_bottom = -44.0
-grow_horizontal = 2
-grow_vertical = 0
-mouse_filter = 2
-theme_override_colors/font_color = Color(0.74, 0.94, 1, 0.94)
-theme_override_colors/font_outline_color = Color(0, 0.06, 0.12, 1)
-theme_override_constants/outline_size = 8
-theme_override_fonts/font = SubResource("SystemFont_ui")
-theme_override_font_sizes/font_size = 34
-text = "门外的虚空"
-horizontal_alignment = 1
-vertical_alignment = 1
-
 [node name="HintLabel" type="Label" parent="HUD"]
+visible = false
 anchors_preset = 5
 anchor_left = 0.5
 anchor_right = 0.5
@@ -117,6 +99,7 @@ horizontal_alignment = 1
 vertical_alignment = 1
 
 [node name="InfoPanel" type="PanelContainer" parent="HUD"]
+visible = false
 offset_left = 22.0
 offset_top = 20.0
 offset_right = 430.0
@@ -151,6 +134,22 @@ theme_override_colors/font_color = Color(0.76, 0.86, 0.96, 0.72)
 theme_override_fonts/font = SubResource("SystemFont_ui")
 theme_override_font_sizes/font_size = 14
 text = "速度 0.0 m/s"
+
+[node name="Coords" type="Label" parent="HUD/InfoPanel/VBox"]
+layout_mode = 2
+mouse_filter = 2
+theme_override_colors/font_color = Color(0.76, 0.86, 0.96, 0.72)
+theme_override_fonts/font = SubResource("SystemFont_ui")
+theme_override_font_sizes/font_size = 14
+text = "坐标 X 0.0   Y 0.0   Z 0.0"
+
+[node name="Facing" type="Label" parent="HUD/InfoPanel/VBox"]
+layout_mode = 2
+mouse_filter = 2
+theme_override_colors/font_color = Color(0.76, 0.86, 0.96, 0.72)
+theme_override_fonts/font = SubResource("SystemFont_ui")
+theme_override_font_sizes/font_size = 14
+text = "朝向 北（0°）"
 
 [node name="Flash" type="ColorRect" parent="HUD"]
 anchors_preset = 15
