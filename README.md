@@ -36,14 +36,23 @@ The-Door-Of-Bings-Server/
 │   ├── config.py            # 读取 .env
 │   ├── db.py                # psycopg2 连接池 / 建表 / 探活
 │   ├── errors.py            # 错误码表 + ApiError
-│   └── api/v1.py            # 4 个业务接口
+│   ├── api/v1.py            # 账号 / 设备 4 个接口
+│   ├── api/world.py         # 世界状态只读快照（WebSocket 的降级方案）
+│   └── world/               # 世界状态（两个列表）
+│       ├── models.py        # Player / WorldItem 实体 + 字段校验
+│       ├── state.py         # 线程安全的内存状态（players + world）
+│       ├── hub.py           # WebSocket 连接登记与广播
+│       ├── ws.py            # /ws/world 端点 + 广播线程
+│       └── persist.py       # 世界物品位置的 PostgreSQL 持久化（可选）
 ├── scripts/
 │   ├── init_db.py           # 建表
-│   └── smoke_test.py        # 端到端冒烟测试（会自动清理临时记录）
+│   ├── smoke_test.py        # 账号接口端到端冒烟测试（会自动清理临时记录）
+│   └── ws_smoke_test.py     # 世界通道冒烟测试（零依赖，自己实现 RFC6455 客户端）
 └── deploy/                  # nginx / systemd 配置模板
 ```
 
-技术栈：**Python 3.12 + Flask 3 + PostgreSQL**（`psycopg2-binary`，不使用 ORM）。
+技术栈：**Python 3.12 + Flask 3 + PostgreSQL**（`psycopg2-binary`，不使用 ORM），
+世界状态实时同步用 **WebSocket**（`flask-sock` + `simple-websocket`）。
 
 ---
 
@@ -180,6 +189,102 @@ BASE：`https://the-door-of-bings.yjlt.top`
 
 ---
 
+## 世界通道（WebSocket）—— 两个列表
+
+服务端维护两张权威表，客户端通过 WebSocket 长连接实时接收，**服务端主动推送**（不是客户端轮询）：
+
+| 列表 | 内容 | 持久化 |
+|---|---|---|
+| `players` | 玩家列表：身份 + **玩家状态** + **位置** + **面向角度** + **动作** | 纯内存（重启即清空：重启后没人在线，留下历史坐标只会是幽灵数据） |
+| `world` | 世界中**可移动物品**的列表：位置、朝向、状态 | 可选落库（`world_items` 表，`WORLD_PERSIST=1`） |
+
+> `players` 由真实连接维护（连上即出现、断开即移除）；`world` 目前**为空列表**，
+> 实体、表结构、上报入口（`WorldState.upsert_world_item`）都已经就位，
+> 等客户端做物品交互时直接往里写即可。
+
+### 端点
+
+`wss://the-door-of-bings.yjlt.top/ws/world`
+
+### 握手（连接后客户端发的第一帧）
+
+```json
+{"type": "hello", "device_id": "ca266db4-...", "user_id": "ZWME-2WKQ",
+ "user_name": "某位旅人", "client_version": "0.1.0", "state": "lobby"}
+```
+
+- `device_id` / `user_id` / `user_name` 三者由服务端按与 `/api/v1/verify` **完全相同的规则**校验（设备锁）；
+- `WORLD_REQUIRE_AUTH=0` 时跳过校验，仅本地自测用，**生产必须为 1**；
+- 同一账号重复连接会**踢掉旧连接**（旧连接先收到 `{"type":"error","code":"KICKED"}` 再被关闭）。
+
+### 下行消息
+
+```json
+{"type": "welcome", "you": "ZWME-2WKQ", "user_name": "某位旅人", "state": "lobby",
+ "tick_hz": 10, "server_version": "1.1.0", "seq": 12}
+
+{"type": "world", "seq": 13, "ts": 1792814370.331,
+ "players": [
+   {"user_id": "ZWME-2WKQ", "user_name": "某位旅人", "state": "in_game",
+    "pos": [1.5, 2.25, -3.0], "yaw": 91.5, "action": "walk",
+    "client_version": "0.1.0", "updated_at": 1792814370.12}
+ ],
+ "world": []}
+
+{"type": "pong", "ts": 1792814370.4}
+{"type": "error", "code": "BAD_FIELD", "msg": "pos 必须是长度为 3 的数组 [x, y, z]"}
+```
+
+`world` 消息在**状态有变化时**立即下发（最高 `WORLD_TICK_HZ` 次/秒），无变化时按
+`WORLD_HEARTBEAT_SEC` 主动心跳下发一次——客户端可据此判断连接是否还活着。
+
+### 上行消息
+
+```json
+{"type": "player.update", "pos": [1.5, 2.25, -3.0], "yaw": 91.5,
+ "action": "walk", "state": "in_game"}
+
+{"type": "ping"}
+```
+
+### 字段约定
+
+| 字段 | 类型 | 约定 |
+|---|---|---|
+| `state` | string | `lobby`（登录/选角界面）、`in_game`（游戏世界）；`offline` 只是语义占位，断线玩家直接移出列表 |
+| `pos` | `[x, y, z]` | 米；单轴绝对值超 `100000` 视为非法；NaN / Infinity 一律拒绝 |
+| `yaw` | number | **角度制**，`[0, 360)`；**0° = 世界 -Z（正北），顺时针增大**，与客户端 `hud.gd` 的八方位换算完全一致 |
+| `action` | string | `idle` / `walk` / `run` / `jump` / `fall`，与 Godot 侧 `player_rig.gd` 的 AnimationPlayer 动画名一一对应 |
+| `client_version` | string | 客户端软件版本（与 `X-Client-Version` 同源） |
+
+> 字段非法只回 `error`（`BAD_FIELD`），**不会断线**，方便客户端边调边改；
+> 只有身份校验失败、连接数满、同账号重复登录才会关闭连接。
+> 校验在限流**之前**执行，所以即使上报超频，非法数据也一定能拿到错误提示。
+
+### HTTP 降级 / 调试
+
+WebSocket 拿不到时（例如部署在 waitress 后面）可以轮询：
+
+```bash
+curl https://the-door-of-bings.yjlt.top/api/v1/world/state      # 两个列表全量快照
+curl https://the-door-of-bings.yjlt.top/api/v1/world/players    # 只要玩家列表
+curl https://the-door-of-bings.yjlt.top/api/v1/world/items      # 只要世界物品列表
+```
+
+### 自测
+
+```bash
+# 服务端已启动且 WORLD_REQUIRE_AUTH=0 时：
+uv run scripts/ws_smoke_test.py
+
+# 生产模式（需要真实账号）：
+WS_DEVICE_ID=xxx WS_USER_ID=ZWME-2WKQ WS_USER_NAME=某位旅人 uv run scripts/ws_smoke_test.py
+```
+
+该脚本自己实现了 RFC6455 客户端（握手 + 掩码帧编解码），**不引入任何第三方库**，按协议字节逐帧验证 16 项断言。
+
+---
+
 ## 数据库表结构
 
 ```sql
@@ -199,7 +304,21 @@ CREATE TABLE accounts (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_login_at TIMESTAMPTZ
 );
+
+-- 世界物品（可移动物件）的权威位置，现在为空表
+CREATE TABLE IF NOT EXISTS world_items (
+    id         TEXT PRIMARY KEY,            -- 例：door_01 / crate_07
+    kind       TEXT NOT NULL DEFAULT 'generic',
+    pos_x      DOUBLE PRECISION NOT NULL DEFAULT 0,
+    pos_y      DOUBLE PRECISION NOT NULL DEFAULT 0,
+    pos_z      DOUBLE PRECISION NOT NULL DEFAULT 0,
+    yaw        DOUBLE PRECISION NOT NULL DEFAULT 0,
+    state      TEXT NOT NULL DEFAULT 'idle',
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 ```
+
+> 玩家位置**不建表**：重启后没人在线，历史坐标没有意义。
 
 ---
 
@@ -240,6 +359,20 @@ CREATE TABLE accounts (
 4. 验证：`curl https://the-door-of-bings.yjlt.top/api/v1/health`
 
 > 应用只监听 `127.0.0.1:2690`，不直接对外暴露；HTTPS 与证书由 nginx 负责。
+
+### WebSocket 与 WSGI 服务器的兼容性（重要）
+
+`/ws/world` 需要能拿到底层 socket 的服务器：
+
+| 服务器 | WebSocket | 说明 |
+|---|---|---|
+| Flask 内置（`uv run main.py`，`threaded=True`） | ✅ | 开发/内测够用 |
+| `gunicorn --workers 1 --threads 8` | ✅ | 生产推荐；**worker 数必须为 1**，否则连接分散到不同进程，内存状态与广播线程会各管各的 |
+| `waitress-serve` | ❌ | 不支持协议升级，只能跑 HTTP；此时客户端请退化为轮询 `/api/v1/world/state` |
+
+> 将来要上多进程 / 多机，就要把内存状态换成 Redis 之类的共享介质，不是改个参数就能搞定的事。
+
+nginx 侧已经把 `/ws/world` 的 `Upgrade` / `Connection` 头透传写进模板，并关掉了该路径的 `proxy_buffering`。
 
 ---
 

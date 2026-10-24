@@ -19,3 +19,15 @@ if Config.DATABASE_URL:
         print(f"[db] 初始化失败：{exc!r}", file=sys.stderr, flush=True)
 
 app = create_app()
+
+# 世界状态：回灌世界物品位置 + 启动广播线程（服务端主动推位置）
+# 注意：WS 需要能拿到底层 socket 的 WSGI 服务器（werkzeug 开发服务器 / gunicorn --threads），
+# waitress 不支持 WebSocket，用 waitress 部署时只有 HTTP 快照接口可用。
+from app.world import persist  # noqa: E402
+from app.world.state import get_state  # noqa: E402
+from app.world.ws import start_broadcaster  # noqa: E402
+
+_WORLD = get_state()
+_WORLD_LOADED = persist.load(_WORLD)
+start_broadcaster(app)
+

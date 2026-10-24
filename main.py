@@ -33,9 +33,21 @@ def main() -> int:
     from app import create_app
 
     app = create_app()
-    print(f"[web] http://{Config.HOST}:{Config.PORT}", flush=True)
+
+    # 世界状态：回灌世界物品位置 + 启动广播线程（服务端主动推位置）
+    from app.world import persist
+    from app.world.state import get_state
+    from app.world.ws import start_broadcaster
+
+    world = get_state()
+    loaded = persist.load(world)
+    start_broadcaster(app)
+    print(f"[world] 玩家列表已就绪，世界物品 {loaded} 个，广播 {world.tick_hz}Hz", flush=True)
+
+    print(f"[web] http://{Config.HOST}:{Config.PORT}  (ws://{Config.HOST}:{Config.PORT}/ws/world)", flush=True)
     app.run(host=Config.HOST, port=Config.PORT, debug=Config.DEBUG, threaded=True)
     return 0
+
 
 
 if __name__ == "__main__":

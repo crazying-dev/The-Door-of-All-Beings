@@ -18,6 +18,16 @@ def create_app(config: type[Config] = Config) -> Flask:
 
     app.register_blueprint(v1_bp)
 
+    from .api.world import bp as world_bp
+
+    app.register_blueprint(world_bp)
+
+    # WebSocket 通道 /ws/world（世界状态实时同步）
+    from .world.ws import init_websockets
+
+    init_websockets(app)
+
+
     @app.errorhandler(ApiError)
     def _api_error(exc: ApiError):
         return jsonify(exc.to_dict()), exc.status
