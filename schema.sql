@@ -24,8 +24,7 @@ CREATE INDEX IF NOT EXISTS accounts_device_id_idx ON accounts (device_id);
 CREATE INDEX IF NOT EXISTS accounts_user_name_idx ON accounts (user_name);
 
 -- ---------------------------------------------------------------------------
--- 世界物品表：世界中可移动物品的权威位置（现在为空表，结构已定型）
--- 玩家位置不落库：进程重启后无人在线，历史坐标没有意义。
+-- 世界物品表：世界中可移动物品的权威位置
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS world_items (
     id         TEXT PRIMARY KEY,                            -- 例：door_01 / crate_07
@@ -37,4 +36,23 @@ CREATE TABLE IF NOT EXISTS world_items (
     state      TEXT NOT NULL DEFAULT 'idle',                -- idle / moving / open …
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- ---------------------------------------------------------------------------
+-- 玩家表：玩家档案与最后已知位置（定时落库）
+-- 启动时所有行会被置为 online = FALSE，因为进程重启后无人真正在线。
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS players (
+    user_id      TEXT PRIMARY KEY REFERENCES accounts (user_id) ON DELETE CASCADE,
+    device_id    TEXT NOT NULL REFERENCES devices (device_id) ON DELETE CASCADE,
+    pos_x        DOUBLE PRECISION NOT NULL DEFAULT 0,       -- 最后已知世界坐标 x
+    pos_y        DOUBLE PRECISION NOT NULL DEFAULT 0,
+    pos_z        DOUBLE PRECISION NOT NULL DEFAULT 0,
+    yaw          DOUBLE PRECISION NOT NULL DEFAULT 0,       -- 面向角度（度）
+    hp           DOUBLE PRECISION NOT NULL DEFAULT 100,     -- 生命值
+    state        TEXT NOT NULL DEFAULT 'idle',              -- idle / moving / dead …
+    online       BOOLEAN NOT NULL DEFAULT FALSE,            -- 是否在线（落库时的快照值）
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS players_device_id_idx ON players (device_id);
 
