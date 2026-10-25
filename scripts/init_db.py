@@ -1,6 +1,11 @@
-"""建表脚本（幂等）。
+"""建表 / 升级脚本（幂等，可重复执行）。
 
-用法：uv run scripts/init_db.py（uv 会自动建 .venv 并安装依赖）
+用法::
+
+    uv run scripts/init_db.py
+
+连接串取自 `.env` 的 ``DATABASE_URL``；表结构见 `schema.sql`。
+``DB_BACKEND=memory`` 时什么也不做（内存后端不需要建表）。
 """
 
 from __future__ import annotations
@@ -10,19 +15,35 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from app import db  # noqa: E402
-from app.config import Config  # noqa: E402
+import config  # noqa: E402
+from db import Database  # noqa: E402
 
 
 def main() -> int:
-    if not Config.DATABASE_URL:
-        print("DATABASE_URL 未配置：复制 .env.example 为 .env 并填写")
+    cfg = config.load_config()
+    if cfg.storage_is_memory:
+        print("[skip] DB_BACKEND=memory：内存后端不需要建表")
+        return 0
+    if not cfg.database_url:
+        print("[fail] DATABASE_URL 未配置：复制 .env.example 为 .env 并填写")
         return 1
-    db.init_pool()
-    db.init_schema()
-    print("[ok] 数据库连接正常，表结构已就绪（devices / accounts）")
-    return 0
+
+    print(f"[..] 连接 {cfg.database_url.split('@')[-1]}")
+    database = Database(
+        dsn=cfg.database_url,
+        minconn=cfg.db_pool_min,
+        maxconn=cfg.db_pool_max,
+    )
+    try:
+        if not database.ping():
+            print("[fail] 数据库连不上")
+            return 1
+        print("[ok] 表结构已就绪（devices / accounts / world_items / players）")
+        return 0
+    finally:
+        database.close()
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

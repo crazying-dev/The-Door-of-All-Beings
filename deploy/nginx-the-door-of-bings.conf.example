@@ -1,8 +1,14 @@
-# 众生之门 账号服务 —— nginx 反向代理 + HTTPS 模板
-# 使用：cp 到 /etc/nginx/conf.d/the-door-of-bings.conf，替换域名/证书路径后 nginx -t && systemctl reload nginx
+# 众生之门 服务端 —— nginx 反向代理 + HTTPS 模板
+#
+# 拓扑：
+#   TCP 游戏协议  直接暴露公网（默认 5423），**不过 nginx**
+#   HTTP 发现接口 127.0.0.1:4231，由本文件反向代理到 https
+#
+# 使用：cp 到 /etc/nginx/conf.d/the-door-of-bings.conf，
+#       替换域名与证书路径后 nginx -t && systemctl reload nginx
 
-upstream thedoor_backend {
-    server 127.0.0.1:2690;
+upstream thedoor_http {
+    server 127.0.0.1:4231;
     keepalive 8;
 }
 
@@ -27,11 +33,11 @@ server {
     access_log /var/log/nginx/thedoor.access.log;
     error_log  /var/log/nginx/thedoor.error.log;
 
-    # 接口很小，限制体积即可
+    # 发现接口只有几百字节
     client_max_body_size 64k;
 
     location / {
-        proxy_pass http://thedoor_backend;
+        proxy_pass http://thedoor_http;
         proxy_http_version 1.1;
         proxy_set_header Connection "";
         proxy_set_header Host $host;
@@ -41,24 +47,11 @@ server {
         proxy_connect_timeout 5s;
         proxy_read_timeout 30s;
     }
-
-    # 世界通道：WebSocket 长连接（服务端主动推位置）
-    # 必须把 Upgrade / Connection 头透传给后端，否则握手拿不到 101。
-    # proxy_read_timeout 要大于服务端的心跳间隔（WORLD_HEARTBEAT_SEC，默认 2s），
-    # 否则 nginx 会在长时间无业务数据时主动掐断。
-    location /ws/world {
-        proxy_pass http://thedoor_backend;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_buffering off;
-        proxy_connect_timeout 5s;
-        proxy_read_timeout 120s;
-        proxy_send_timeout 120s;
-    }
-
 }
+
+# --------------------------------------------------------------------------- #
+# TCP 游戏端口不在 nginx 里代理：nginx 的 stream 模块虽然能转发 TCP，
+# 但它会把客户端 IP 换成 127.0.0.1，服务端就拿不到真实来源了。
+# 需要时请在云厂商安全组 / ufw 里放行 5423/TCP：
+#   ufw allow 5423/tcp
+# --------------------------------------------------------------------------- #

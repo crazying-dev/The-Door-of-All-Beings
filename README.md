@@ -1,403 +1,202 @@
-# 众生之门 · 账号服务端（The Door of All Beings Server）
+# 众生之门 服务端（The Door of All Beings · Server）
 
-《众生之门》（罗小黑战记同人二创）客户端的账号 / 设备绑定服务，对应 Godot 项目仓库
-[`The-Door-of-All-Beings`](https://github.com/crazying-dev/The-Door-of-All-Beings) 的 `Server` 分支。
+TCP 游戏协议 + HTTP 发现接口。无状态设备凭证、内存权威世界、定时落库。
 
-> 本项目为粉丝二创作品，与《罗小黑战记》官方无关；IP 版权归寒木春华动画工作室所有。
-
----
-
-## 产品规则（服务端强制执行）
-
-| 规则 | 实现方式 |
+| 项 | 值 |
 |---|---|
-| 账号只能存在于首次激活的设备上 | `accounts.device_id` 为 `UNIQUE`；`/api/v1/` 每次都重新比对 |
-| 同一设备不能注册多个账号 | `accounts.device_id` 唯一约束 → `DEVICE_ALREADY_BOUND` |
-| 设备标识由服务端签发并落库 | `POST /api/v1/device` 生成 UUID 写入 `devices` 表 |
-| 用户 ID 由服务端生成 | `/api/v1/register` 生成 `XXXX-XXXX` |
-| 用户名称全局唯一 | `accounts.user_name` 为 `UNIQUE` |
-| 为「角色死亡后档案注销 / 30 分钟禁登」预留 | `accounts.status` + `accounts.locked_until` |
+| 协议版本 | **1.1**（4 行竖线报文，长连接，10Hz 推送） |
+| 服务版本 | **2.0.0** |
+| TCP 游戏端口 | `PORT`（默认 **5423**） |
+| HTTP 发现端口 | `HTTP_PORT`（默认 **4231**） |
+| 存储 | PostgreSQL（生产）/ 内存（调试与测试） |
+| 依赖 | Python 3.12 · flask · waitress · psycopg2-binary · python-dotenv |
+
+协议细节全部在 **[`protocol.md`](protocol.md)**（客户端对接看那一份就够）。
 
 ---
 
-## 目录结构
+## 1. 快速开始
 
-```
-The-Door-Of-Bings-Server/
-├── main.py                  # 开发环境入口（Flask 内置服务器）
-├── wsgi.py                  # 生产环境 WSGI 入口（waitress）
-├── schema.sql               # 表结构（幂等，可重复执行）
-├── pyproject.toml
-├── uv.lock                  # 依赖锁定文件（入库，保证各机器安装一致）
-├── .python-version          # 固定 Python 3.12（uv 缺则自动下载）
-├── .env.example             # 配置模板（.env 不入库）
-├── app/
-│   ├── __init__.py          # Flask 应用工厂 + 统一错误处理
-│   ├── config.py            # 读取 .env
-│   ├── db.py                # psycopg2 连接池 / 建表 / 探活
-│   ├── errors.py            # 错误码表 + ApiError
-│   ├── api/v1.py            # 账号 / 设备 4 个接口
-│   ├── api/world.py         # 世界状态只读快照（WebSocket 的降级方案）
-│   └── world/               # 世界状态（两个列表）
-│       ├── models.py        # Player / WorldItem 实体 + 字段校验
-│       ├── state.py         # 线程安全的内存状态（players + world）
-│       ├── hub.py           # WebSocket 连接登记与广播
-│       ├── ws.py            # /ws/world 端点 + 广播线程
-│       └── persist.py       # 世界物品位置的 PostgreSQL 持久化（可选）
-├── scripts/
-│   ├── init_db.py           # 建表
-│   ├── smoke_test.py        # 账号接口端到端冒烟测试（会自动清理临时记录）
-│   └── ws_smoke_test.py     # 世界通道冒烟测试（零依赖，自己实现 RFC6455 客户端）
-└── deploy/                  # nginx / systemd 配置模板
-```
-
-技术栈：**Python 3.12 + Flask 3 + PostgreSQL**（`psycopg2-binary`，不使用 ORM），
-世界状态实时同步用 **WebSocket**（`flask-sock` + `simple-websocket`）。
-
----
-
-## 快速开始
-
-前置条件只有一条：**装好 [uv](https://docs.astral.sh/uv/)**。
+### 1.1 本地跑起来（不接数据库）
 
 ```bash
-# Linux / macOS
-curl -LsSf https://astral.sh/uv/install.sh | sh
+cp .env.example .env      # Windows: copy .env.example .env
+# .env 里写一行 DEVICE_ID_SECRET=<32+ 字节随机>
+uv run main.py --backend memory
 ```
 
-```powershell
-# Windows（PowerShell）
-powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
+`--backend memory` 时数据只在内存，重启即清空；`DEVICE_ID_SECRET` 会临时生成（仅内存后端允许）。
 
-之后**不需要 `uv venv`、不需要 `pip install`、不需要手动激活虚拟环境**，一条 `uv run` 就把环境和依赖准备好并直接执行脚本：
+### 1.2 生产跑起来（接 PostgreSQL）
 
 ```bash
-# ① 配置连接串（.env 已在 .gitignore 中，不会入库）
-cp .env.example .env          # Windows: copy .env.example .env
-#   编辑 .env，填入 DATABASE_URL
-
-# ② 建表（幂等）—— 首次运行会自动创建 .venv 并安装依赖
-uv run scripts/init_db.py
-
-# ③ 开发运行（Flask 内置服务器）
-uv run main.py
-
-# ④ 生产运行（waitress）
-uv run waitress-serve --host 127.0.0.1 --port 2690 wsgi:app
-
-# ⑤ 端到端自测（需 ③ 或 ④ 已启动）
-uv run scripts/smoke_test.py
+cp .env.example .env
+python -c "import secrets;print(secrets.token_hex(32))"   # 填进 DEVICE_ID_SECRET
+uv run scripts/init_db.py      # 建表 / 升级（幂等）
+uv run main.py check           # 自检：配置 / 存储 / 设备密钥
+uv run main.py                 # 同时起 TCP 5423 与 HTTP 4231
 ```
 
-### 一条 `uv run` 背后发生了什么
-
-| 步骤 | uv 自动完成 |
-|---|---|
-| 1 | 读 `.python-version` → 本机没有 Python 3.12 时**自动下载**一份到 uv 的托管目录 |
-| 2 | 在项目根创建 `.venv`（可用环境变量 `UV_PROJECT_ENVIRONMENT` 改路径） |
-| 3 | 按 `uv.lock` 精确安装 flask / psycopg2-binary / python-dotenv / waitress，并自动同步 |
-| 4 | 用该环境执行你传入的脚本或命令 |
-
-所以一个刚克隆下来的仓库是**零准备可运行**的。
-
-### 常用命令对照
-
-| 目的 | 命令 |
-|---|---|
-| 建/更新环境与依赖（隐式） | `uv run main.py` |
-| 显式同步环境 | `uv sync` |
-| 按锁文件精确安装（CI / 部署） | `uv sync --frozen` |
-| 校验锁文件是否与 `pyproject.toml` 一致 | `uv lock --check` |
-| 临时跑一段 Python | `uv run python -c "import flask; print(flask.__version__)"` |
-| 不改锁文件地运行（部署/离线） | `uv run --frozen --no-sync main.py` |
-
-> 为什么没有 `uv run serve` 这类命令别名？本项目是扁平结构的**应用**而非库（`package = false`），
-> uv 的入口点表 `[project.scripts]` 只在项目被构建安装后才生效，所以约定直接用脚本路径运行。
+> ⚠️ `DEVICE_ID_SECRET` **定下来就不要改**。设备 ID 由它签名，
+> 换了密钥所有老客户端存的 device_id 全部失效，老账号再也绑不上。
 
 ---
 
-## API 契约 v1
-
-BASE：`https://the-door-of-bings.yjlt.top`
-所有请求与响应均为 `application/json; charset=utf-8`（响应中的中文不会被转义）。
-成功响应一定含 `"ok": true`；失败响应一定含 `"ok": false` + `code` + `msg`。
-
-### 1. `GET /api/v1/health`
-
-```json
-{ "ok": true, "service": "the-door-of-bings", "version": "1.0.0", "database": "up", "time": "2026-10-02T05:41:53+00:00" }
-```
-
-### 2. `POST /api/v1/device` — 签发设备标识
-
-请求体可为 `{}`（总是签发新 UUID）：
-
-```json
-{ "ok": true, "device_id": "ca266db4-b919-42dc-b7cc-a6aa32c0dbfa", "issued": true, "account": null }
-```
-
-请求体带 `{"device_id": "..."}` 时为**幂等**语义：已知则原样返回并刷新 `last_seen_at`（`issued: false`），
-未知则收编入库（用于兼容旧版本客户端本地已存在的设备标识）。
-
-无论哪种情形，响应都会带一个 `account` 字段：该设备**已绑定**的账号，未绑定则为 `null`：
-
-```json
-{ "ok": true, "device_id": "ca266db4-...", "issued": false,
-  "account": { "user_id": "ZWME-2WKQ", "user_name": "某位旅人", "status": "active" } }
-```
-
-客户端据此可以在本地 `load.bin` 丢失时恢复登录（设备即身份，无需重新注册）。
-
-### 3. `POST /api/v1/register` — 注册
-
-```json
-// 请求
-{ "device_id": "ca266db4-...", "user_name": "某位旅人" }
-
-// 成功
-{ "ok": true, "user_id": "ZWME-2WKQ", "user_name": "某位旅人", "device_id": "ca266db4-..." }
-
-// 失败
-{ "ok": false, "code": "DEVICE_ALREADY_BOUND", "msg": "该设备已绑定账号，不能重复注册" }
-```
-
-### 4. `POST /api/v1/verify` — 登录校验（设备锁执行点）
-
-```json
-// 请求（三者必须同时提供）
-{ "device_id": "ca266db4-...", "user_id": "ZWME-2WKQ", "user_name": "某位旅人" }
-
-// 成功
-{ "ok": true, "user_id": "ZWME-2WKQ", "user_name": "某位旅人", "device_id": "ca266db4-..." }
-```
-
-### 错误码
-
-| code | HTTP | 说明 |
-|---|---|---|
-| `BAD_REQUEST` | 400 | 请求体不是 JSON 对象、缺字段、字段类型/长度非法 |
-| `DEVICE_UNKNOWN` | 404 | 设备未登记（需先调用 `/api/v1/device`） |
-| `USER_NOT_FOUND` | 404 | `user_id` 不存在（旧账号/换设备/数据被删） |
-| `DEVICE_MISMATCH` | 403 | 账号绑定的是别的设备 —— **设备锁** |
-| `NAME_MISMATCH` | 403 | 用户名称与该账号不符 |
-| `DEVICE_ALREADY_BOUND` | 409 | 该设备已绑定账号，不能重复注册 |
-| `NAME_TAKEN` | 409 | 该名称已被占用 |
-| `ACCOUNT_LOCKED` | 403 | 账号或设备被停用 / 处于禁登期 |
-| `NOT_FOUND` | 404 | 接口路径不存在 |
-| `INTERNAL` | 500 | 服务器内部错误 |
-
----
-
-## 世界通道（WebSocket）—— 两个列表
-
-服务端维护两张权威表，客户端通过 WebSocket 长连接实时接收，**服务端主动推送**（不是客户端轮询）：
-
-| 列表 | 内容 | 持久化 |
-|---|---|---|
-| `players` | 玩家列表：身份 + **玩家状态** + **位置** + **面向角度** + **动作** | 纯内存（重启即清空：重启后没人在线，留下历史坐标只会是幽灵数据） |
-| `world` | 世界中**可移动物品**的列表：位置、朝向、状态 | 可选落库（`world_items` 表，`WORLD_PERSIST=1`） |
-
-> `players` 由真实连接维护（连上即出现、断开即移除）；`world` 目前**为空列表**，
-> 实体、表结构、上报入口（`WorldState.upsert_world_item`）都已经就位，
-> 等客户端做物品交互时直接往里写即可。
-
-### 端点
-
-`wss://the-door-of-bings.yjlt.top/ws/world`
-
-### 握手（连接后客户端发的第一帧）
-
-```json
-{"type": "hello", "device_id": "ca266db4-...", "user_id": "ZWME-2WKQ",
- "user_name": "某位旅人", "client_version": "0.1.0", "state": "lobby"}
-```
-
-- `device_id` / `user_id` / `user_name` 三者由服务端按与 `/api/v1/verify` **完全相同的规则**校验（设备锁）；
-- `WORLD_REQUIRE_AUTH=0` 时跳过校验，仅本地自测用，**生产必须为 1**；
-- 同一账号重复连接会**踢掉旧连接**（旧连接先收到 `{"type":"error","code":"KICKED"}` 再被关闭）。
-
-### 下行消息
-
-```json
-{"type": "welcome", "you": "ZWME-2WKQ", "user_name": "某位旅人", "state": "lobby",
- "tick_hz": 10, "server_version": "1.1.0", "seq": 12}
-
-{"type": "world", "seq": 13, "ts": 1792814370.331,
- "players": [
-   {"user_id": "ZWME-2WKQ", "user_name": "某位旅人", "state": "in_game",
-    "pos": [1.5, 2.25, -3.0], "yaw": 91.5, "action": "walk",
-    "client_version": "0.1.0", "updated_at": 1792814370.12}
- ],
- "world": []}
-
-{"type": "pong", "ts": 1792814370.4}
-{"type": "error", "code": "BAD_FIELD", "msg": "pos 必须是长度为 3 的数组 [x, y, z]"}
-```
-
-`world` 消息在**状态有变化时**立即下发（最高 `WORLD_TICK_HZ` 次/秒），无变化时按
-`WORLD_HEARTBEAT_SEC` 主动心跳下发一次——客户端可据此判断连接是否还活着。
-
-### 上行消息
-
-```json
-{"type": "player.update", "pos": [1.5, 2.25, -3.0], "yaw": 91.5,
- "action": "walk", "state": "in_game"}
-
-{"type": "ping"}
-```
-
-### 字段约定
-
-| 字段 | 类型 | 约定 |
-|---|---|---|
-| `state` | string | `lobby`（登录/选角界面）、`in_game`（游戏世界）；`offline` 只是语义占位，断线玩家直接移出列表 |
-| `pos` | `[x, y, z]` | 米；单轴绝对值超 `100000` 视为非法；NaN / Infinity 一律拒绝 |
-| `yaw` | number | **角度制**，`[0, 360)`；**0° = 世界 -Z（正北），顺时针增大**，与客户端 `hud.gd` 的八方位换算完全一致 |
-| `action` | string | `idle` / `walk` / `run` / `jump` / `fall`，与 Godot 侧 `player_rig.gd` 的 AnimationPlayer 动画名一一对应 |
-| `client_version` | string | 客户端软件版本（与 `X-Client-Version` 同源） |
-
-> 字段非法只回 `error`（`BAD_FIELD`），**不会断线**，方便客户端边调边改；
-> 只有身份校验失败、连接数满、同账号重复登录才会关闭连接。
-> 校验在限流**之前**执行，所以即使上报超频，非法数据也一定能拿到错误提示。
-
-### HTTP 降级 / 调试
-
-WebSocket 拿不到时（例如部署在 waitress 后面）可以轮询：
+## 2. 命令行
 
 ```bash
-curl https://the-door-of-bings.yjlt.top/api/v1/world/state      # 两个列表全量快照
-curl https://the-door-of-bings.yjlt.top/api/v1/world/players    # 只要玩家列表
-curl https://the-door-of-bings.yjlt.top/api/v1/world/items      # 只要世界物品列表
+uv run main.py serve     # TCP + HTTP（默认）
+uv run main.py tcp       # 只起 TCP 游戏协议
+uv run main.py http      # 只起 HTTP 发现 / 健康检查
+uv run main.py check     # 自检：配置 / 存储 / 设备密钥 / 动作表
+uv run main.py version   # 打印服务与协议版本
 ```
 
-### 自测
+常用参数：`--debug`（调试日志 + HTTP 走 Werkzeug）、`--backend memory|postgres`。
+
+---
+
+## 3. 代码结构
+
+```
+server/
+├─ main.py          入口：组装 Service、日志、CLI
+├─ config.py        所有配置集中在这里（只从 .env / 环境变量读）
+├─ protocol.py      协议 v1.1：解析 / 编码 / 错误码
+├─ server.py        TCP 监听、帧读取、单连接线程、防重放
+├─ session.py       长连接会话（Session）与会话表 + 10Hz 推送线程（SessionHub）
+├─ actions.py       动作注册表（@action），业务入口
+├─ users.py         账号业务：设备登记 / 注册 / 登录
+├─ device_id.py     设备 ID 的签发与无状态校验（HMAC）
+├─ game.py          内存权威：世界物品 + 在线玩家，定时落库
+├─ store.py         存储抽象：PostgresStore / MemoryStore
+├─ db.py            PostgreSQL 连接池
+├─ http_api.py      HTTP 发现接口 + /healthz
+├─ schema.sql       表结构（幂等，可重复执行）
+├─ protocol.md      协议规范（客户端对接看这份）
+├─ deploy/          nginx 与 systemd 示例
+└─ scripts/
+   ├─ init_db.py        建表 / 升级
+   ├─ tcp_smoke_test.py 协议冒烟测试（无需数据库）
+   └─ store_check.py    PostgreSQL 存储层校验（跑完自清理）
+```
+
+---
+
+## 4. 校验与测试
+
+服务端没有引入 pytest：两个脚本都是零额外依赖，退出码 0 = 全绿。
 
 ```bash
-# 服务端已启动且 WORLD_REQUIRE_AUTH=0 时：
-uv run scripts/ws_smoke_test.py
+# 协议全链路（内存后端，起真 TCP，不用数据库）
+uv run scripts/tcp_smoke_test.py          # 当前 75/75
+uv run scripts/tcp_smoke_test.py -v       # 逐条打印
 
-# 生产模式（需要真实账号）：
-WS_DEVICE_ID=xxx WS_USER_ID=ZWME-2WKQ WS_USER_NAME=某位旅人 uv run scripts/ws_smoke_test.py
+# PostgreSQL 存储层（用真库，但只碰自己造的临时数据，跑完清理）
+uv run scripts/store_check.py             # 当前 12/12
+
+# 配自检（真实生产环境跑这条最合适）
+uv run main.py check
 ```
 
-该脚本自己实现了 RFC6455 客户端（握手 + 掩码帧编解码），**不引入任何第三方库**，按协议字节逐帧验证 16 项断言。
+`tcp_smoke_test.py` 覆盖：握手 / 设备签发与确认 / 注册 / 登录 / 重放去重 /
+哈希篡改 / 时间戳过期 / 未知动作 / 设备伪造 / 10Hz PUSH / 双客户端同屏 / 断线下线。
 
 ---
 
-## 数据库表结构
+## 5. 配置项（全部在 `.env`）
 
-```sql
-CREATE TABLE devices (
-    device_id    TEXT PRIMARY KEY,          -- 服务端签发的 UUID
-    status       TEXT NOT NULL DEFAULT 'active',
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE accounts (
-    user_id       TEXT PRIMARY KEY,         -- 形如 ZWME-2WKQ
-    device_id     TEXT NOT NULL UNIQUE REFERENCES devices (device_id) ON DELETE CASCADE,
-    user_name     TEXT NOT NULL UNIQUE,
-    status        TEXT NOT NULL DEFAULT 'active',
-    locked_until  TIMESTAMPTZ,              -- 预留：角色死亡后 30 分钟禁登
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    last_login_at TIMESTAMPTZ
-);
-
--- 世界物品（可移动物件）的权威位置，现在为空表
-CREATE TABLE IF NOT EXISTS world_items (
-    id         TEXT PRIMARY KEY,            -- 例：door_01 / crate_07
-    kind       TEXT NOT NULL DEFAULT 'generic',
-    pos_x      DOUBLE PRECISION NOT NULL DEFAULT 0,
-    pos_y      DOUBLE PRECISION NOT NULL DEFAULT 0,
-    pos_z      DOUBLE PRECISION NOT NULL DEFAULT 0,
-    yaw        DOUBLE PRECISION NOT NULL DEFAULT 0,
-    state      TEXT NOT NULL DEFAULT 'idle',
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-```
-
-> 玩家位置**不建表**：重启后没人在线，历史坐标没有意义。
-
----
-
-## 部署
-
-`deploy/` 下提供了模板，把占位符换成实际值即可。
-
-1. 拉取代码到服务器（例如 `/root/The-Door-Of-Bings-Server`，即 `Server` 分支的 worktree 所在目录）：
-
-   ```bash
-   # 若服务器还没有 uv
-   curl -LsSf https://astral.sh/uv/install.sh | sh
-
-   git clone -b Server https://github.com/crazying-dev/The-Door-of-All-Beings.git /root/The-Door-Of-Bings-Server
-   cd /root/The-Door-of-Bings-Server
-
-   uv sync --frozen                    # 按 uv.lock 精确安装（不改锁文件）
-   cp .env.example .env && vi .env      # 填 DATABASE_URL
-   uv run --frozen scripts/init_db.py   # 建表（幂等）
-   ```
-
-2. 用 systemd 守护（或用 tmux，与 forum 的部署习惯保持一致）：
-
-   ```bash
-   cp deploy/the-door-of-bings.service.example /etc/systemd/system/the-door-of-bings.service
-   systemctl daemon-reload && systemctl enable --now the-door-of-bings
-   systemctl status the-door-of-bings
-   ```
-
-3. nginx 反代 + HTTPS 证书：
-
-   ```bash
-   cp deploy/nginx-the-door-of-bings.conf.example /etc/nginx/conf.d/the-door-of-bings.conf
-   certbot --nginx -d the-door-of-bings.yjlt.top
-   nginx -t && systemctl reload nginx
-   ```
-
-4. 验证：`curl https://the-door-of-bings.yjlt.top/api/v1/health`
-
-> 应用只监听 `127.0.0.1:2690`，不直接对外暴露；HTTPS 与证书由 nginx 负责。
-
-### WebSocket 与 WSGI 服务器的兼容性（重要）
-
-`/ws/world` 需要能拿到底层 socket 的服务器：
-
-| 服务器 | WebSocket | 说明 |
+| 键 | 默认 | 说明 |
 |---|---|---|
-| Flask 内置（`uv run main.py`，`threaded=True`） | ✅ | 开发/内测够用 |
-| `gunicorn --workers 1 --threads 8` | ✅ | 生产推荐；**worker 数必须为 1**，否则连接分散到不同进程，内存状态与广播线程会各管各的 |
-| `waitress-serve` | ❌ | 不支持协议升级，只能跑 HTTP；此时客户端请退化为轮询 `/api/v1/world/state` |
-
-> 将来要上多进程 / 多机，就要把内存状态换成 Redis 之类的共享介质，不是改个参数就能搞定的事。
-
-nginx 侧已经把 `/ws/world` 的 `Upgrade` / `Connection` 头透传写进模板，并关掉了该路径的 `proxy_buffering`。
-
----
-
-## 客户端对接（Godot）
-
-客户端（`code/StartCreen/`）的登录流程已改为：
-
-1. 首次运行：`POST /api/v1/device`（body `{}`）拿到 `device_id`，写入 `user://InstallationUniqueID.bin`；
-2. 输入名称 → `POST /api/v1/register` → 拿到 `user_id`，写入 `user://load.bin`；
-3. 之后每次启动：读取两个文件 → `POST /api/v1/verify` → 通过则进入游戏；
-4. 校验失败时：`USER_NOT_FOUND` / `DEVICE_UNKNOWN` → 重新走 1、2；
-   `DEVICE_MISMATCH` / `NAME_MISMATCH` / `ACCOUNT_LOCKED` → 提示用户，不再放行。
-
-全部请求走 **HTTPS**，并设置了超时与重试上限（旧版本用的是 `http://yjlt.top/TheDoorOfBings/UUID4/`，已废弃）。
+| `DATABASE_URL` | — | PostgreSQL 连接串 |
+| `DB_BACKEND` | `postgres` | `postgres` / `memory` |
+| `DB_POOL_MIN` / `DB_POOL_MAX` | 1 / 8 | 连接池上下限 |
+| `HOST` / `PORT` | — / 5423 | **对外公布**的地址与 TCP 端口（只给发现接口用） |
+| `TCP_BIND` | `0.0.0.0` | TCP 实际监听地址 |
+| `HTTP_BIND` / `HTTP_PORT` | `0.0.0.0` / 4231 | HTTP 监听地址与端口 |
+| `DEVICE_ID_SECRET` | — | 设备 ID 的 HMAC 密钥（≥ 32 字节，**必填**） |
+| `DEVICE_ID_MAX_AGE` | 0 | 设备 ID 有效期（秒），0 = 永不过期 |
+| `REQUEST_TIME_WINDOW` | 300 | 报文时间戳容差（秒） |
+| `DEBUG` | 0 | 1 = 调试日志 + HTTP 走 Werkzeug |
+| `MAX_LINE_BYTES` | 16384 | 单行上限（device_id hex 后 2048 字符，勿小于 4096） |
+| `READ_TIMEOUT` | 180 | 连接读超时（秒） |
+| `MAX_CONNECTIONS` | 256 | 最大并发连接数 |
+| `PUSH_HZ` | 10 | 世界快照推送频率 |
+| `AUTOSAVE_INTERVAL` | 60 | 内存落库间隔（秒） |
+| `USER_NAME_MAX_LEN` | 24 | 用户名称最大长度 |
 
 ---
 
-## 安全说明
+## 6. 设计要点
 
-* `DATABASE_URL` 只存在于服务器上的 `.env`（已被 `.gitignore` 忽略），**任何情况下都不要提交**；
-* `device_id` 只是设备标识，不是认证凭据；真正的放行依据是服务端比对的「设备 + 用户 ID + 名称」三元组；
-* 建议为应用单独建一个数据库账号，只授予 `thedoorofbings` 库的 CRUD 权限，不要使用 `postgres` 超级用户。
+### 6.1 设备 ID：服务端签发，无状态校验
+
+设备 ID 是一张 **1024 字节的「签名票据」**，结构：
+
+```
+[ver(2)][lenFlag(2)][ts(4)][nonce(32)][fp(16)][tag(32)][HKDF 扩展(N)]
+```
+
+- `tag = HMAC-SHA256(DEVICE_ID_SECRET, ver|lenFlag|ts | nonce | fp)`
+- 最后一大段扩展由 `tag` 派生，因此**改任意一个字节都校验不过**
+- 校验只看自身 HMAC，**不查库、不建会话**
+- 客户端**不持密钥**（自己签等于把密钥发给全世界，且泄露后无法回收）
+
+一个设备只能绑一个账号，一个账号永久绑首次登记的设备（不做设备迁移）。
+
+### 6.2 内存权威 + 定时落库
+
+世界物品与在线玩家以内存为准，数据库只是快照：
+
+- `state` 动作只改内存（不做 DB IO，10Hz 上报也不怕）
+- 每 `AUTOSAVE_INTERVAL` 秒 upsert 一次；退出前再存一次
+- 落库失败不丢数据，写 `tmp/databaseErrordb.json` 兼底
+- 每个集合带修订号 `rev`：推送时只带变化的部分
+
+### 6.3 长连接 + 10Hz 推送
+
+- 一个 TCP 连接 = 一个 `Session`，刚连上是匿名的，`login`/`register` 后绑定账号
+- `SessionHub` 单线程按 `PUSH_HZ` 广播，世界快照每 tick 只构造一次
+- 同账号多会话时，最后一个断开才算下线（`has_user` 判定）
+
+### 6.4 防重放（有局限）
+
+`ReplayGuard` 按「会话 + 时间戳 + 正文 sha256」去重，只拦 `register` / `device` / `item` 这类写动作。
+**跨连接重放挡不住**——协议目前没有 nonce 字段。详见 `protocol.md` §9。
 
 ---
 
-## 许可
+## 7. 部署
 
-BSD 3-Clause，与主仓库一致。
+两个示例都在 `deploy/`：
+
+- `nginx-the-door-of-bings.conf.example` —— 只反代 HTTP 发现接口（4231）
+- `the-door-of-bings.service.example` —— systemd，`ExecStart=uv run main.py serve`
+
+**TCP 5423 不经 nginx**：nginx 的 stream 模块会把客户端 IP 换成 127.0.0.1，
+服务端就拿不到真实来源了。直接在安全组 / ufw 里放行：
+
+```bash
+ufw allow 5423/tcp
+```
+
+---
+
+## 8. 与旧版的差异（1.x → 2.0）
+
+旧版是 `app/` 下的 Flask + WebSocket 结构，2.0 彻底换掉：
+
+| 方面 | 旧（≤ 1.x） | 新（2.0） |
+|---|---|---|
+| 游戏通道 | WebSocket `/ws/world` | **原生 TCP 4 行协议**，长连接 |
+| 权限模型 | Cookie / 会话 | 协议头自带 device_id + 会话绑定 |
+| `user_id` | 客户端生成 | **服务端生成**（`ZWME-2WKQ`） |
+| device_id | 客户端自签（持密钥） | **服务端签发**，客户端只存不用算 |
+| 发现接口 | `/game/api`（import 期请求 ipify） | `/api/v1/endpoint`（host/port 只读 `.env`） |
+| 启动条件 | `HOST` == 公网 IP 才启动 | **永远启动**，`HOST` 只用于下发 |
+| 帧读取 | `recv(65536)` 一次 | 带缓冲的行读取器（切包/粘包/2048 字符全 OK） |
+| 事务 | 就地捕 UniqueViolation（事务已 aborted） | `SAVEPOINT` + `ROLLBACK TO SAVEPOINT` |
+| 错误响应 | 裸文本 | 统一 `FAIL \| action \| code \| message` |
+| 测试 | 无 | `tcp_smoke_test.py` + `store_check.py` |
+
+旧 `database.py` 兼容层已删除（`users.user` 签名已改成依赖 `Store`，直接 `import users` 即可）。

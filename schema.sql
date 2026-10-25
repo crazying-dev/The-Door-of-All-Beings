@@ -2,11 +2,19 @@
 -- 幂等：可重复执行
 
 CREATE TABLE IF NOT EXISTS devices (
-    device_id    TEXT PRIMARY KEY,
-    status       TEXT NOT NULL DEFAULT 'active',
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    device_id      TEXT PRIMARY KEY,
+    status         TEXT NOT NULL DEFAULT 'active',
+    client_version TEXT NOT NULL DEFAULT '',   -- 最近一次上报的客户端版本
+    platform       TEXT NOT NULL DEFAULT '',   -- windows / linux / android …
+    last_ip        TEXT NOT NULL DEFAULT '',   -- 最近一次连接来源 IP
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- 旧库升级：这三个列是 v1.1 才加的，可重复执行
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS client_version TEXT NOT NULL DEFAULT '';
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS platform       TEXT NOT NULL DEFAULT '';
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS last_ip        TEXT NOT NULL DEFAULT '';
 
 -- 一个设备只能绑定一个账号（device_id UNIQUE）
 -- 一个账号永久绑定首次登记的设备（本表不做设备迁移）

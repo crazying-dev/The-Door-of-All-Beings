@@ -1,6 +1,9 @@
 """PostgreSQL 连接池与初始化。"""
 
+from __future__ import annotations
+
 import atexit
+import logging
 import os
 from contextlib import contextmanager
 from pathlib import Path
@@ -8,6 +11,11 @@ from typing import Any, Iterator
 
 from psycopg2 import pool as pg_pool
 from psycopg2.extras import RealDictCursor
+
+log = logging.getLogger(__name__)
+
+## schema.sql 就在本文件旁边（目录提升后不再需要上跳一层）
+SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
 
 
 class Database:
@@ -20,14 +28,20 @@ class Database:
       DB_POOL_MAX   最大连接数(默认 8)
     """
 
-    def __init__(self):
-        dsn = os.getenv("DATABASE_URL", "").strip()
+    def __init__(
+        self,
+        dsn: str | None = None,
+        minconn: int | None = None,
+        maxconn: int | None = None,
+        init_schema: bool = True,
+    ) -> None:
+        dsn = (dsn if dsn is not None else os.getenv("DATABASE_URL", "")).strip()
         if not dsn:
             raise RuntimeError(
                 "DATABASE_URL 未配置（请复制 .env.example 为 .env 并填写）"
             )
-        minconn = int(os.getenv("DB_POOL_MIN", "1"))
-        maxconn = int(os.getenv("DB_POOL_MAX", "8"))
+        minconn = minconn if minconn is not None else int(os.getenv("DB_POOL_MIN", "1"))
+        maxconn = maxconn if maxconn is not None else int(os.getenv("DB_POOL_MAX", "8"))
 
         # 创建线程安全连接池
         self._pool = pg_pool.ThreadedConnectionPool(minconn, maxconn, dsn)
@@ -36,7 +50,9 @@ class Database:
         atexit.register(self.close)
 
         # 初始化表结构(幂等, 可重复执行)
-        self._init_schema()
+        if init_schema:
+            self._init_schema()
+
 
     # ------------------------------------------------------------------ #
     # 连接/游标借用
@@ -70,11 +86,12 @@ class Database:
     # ------------------------------------------------------------------ #
 
     def _init_schema(self) -> None:
-        """执行 server/schema.sql（devices / accounts / world_items）。"""
-        schema_path = Path(__file__).resolve().parent.parent / "schema.sql"
-        sql = schema_path.read_text(encoding="utf-8")
+        """执行 schema.sql（devices / accounts / world_items / players）。"""
+        sql = SCHEMA_PATH.read_text(encoding="utf-8")
         with self.cursor(dict_rows=False) as cur:
             cur.execute(sql)
+        log.info("数据库表结构已就绪 (%s)", SCHEMA_PATH.name)
+
 
     def ping(self) -> bool:
         """数据库可用返回 True，不抛异常。"""
@@ -83,9 +100,17 @@ class Database:
                 cur.execute("SELECT 1")
                 cur.fetchone()
             return True
-        except Exception:
+        except Exception:  # noqa: BLE001 - 探活失败就是 False，不要让调用方处理
             return False
 
+
     def close(self) -> None:
-        """关闭连接池（由 atexit 在服务退出时自动调用，也可手动调用）。"""
-        self._pool.closeall()
+        """关闭连接池（幂等：atexit 与服务退出都会调，不能重复关）。"""
+        pool = getattr(self, "_pool", None)
+        if pool is None:
+            return
+        self._pool = None
+        try:
+            pool.closeall()
+        except Exception:  # noqa: BLE001 - 已经关过就别再抱错
+            pass

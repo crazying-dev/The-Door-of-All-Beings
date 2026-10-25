@@ -10,3 +10,6 @@ __pycache__/
 # 运行产物
 *.log
 tmp/
+
+# 本地提交信息临时文件
+_msg.txt
