@@ -58,6 +58,10 @@ const FALLBACK_ACTIONS := {
 ## 一旦静态类型成 Node3D / CanvasLayer，调用 teleport_to_point() / set_wipe_progress() 就会报“找不到成员”。
 var _player
 var _hud
+## 联机同步层（code/net/net_sync.gd）。用代码挂上来而不是改 world.tscn：
+## 场景文件不必动，未登录 / 断线时也只是静默失败，不影响单机试玩。
+## 故意不写类型标注：net_sync.gd 上是自定义脚本，静态类型成 Node 会报找不到成员。
+var _net_sync = null
 
 var _current_world: int = 0
 var _cooldown: float = 0.0
@@ -71,6 +75,7 @@ func _ready() -> void:
 
 	_player = $Player
 	_hud = $HUD
+	_setup_net_sync()
 
 	# 用字符串形式连接信号：光柱脚本自定义了 gate_entered，静态类型 Node 上找不到它。
 	_pillar.connect("gate_entered", _on_gate_entered)
@@ -184,6 +189,22 @@ func _respawn() -> void:
 	_cooldown = TELEPORT_COOLDOWN
 	if _hud != null:
 		_hud.flash_white()
+
+
+func _setup_net_sync() -> void:
+	var script: Variant = load("res://code/net/net_sync.gd")
+	if script == null:
+		push_warning("未找到 net_sync.gd，联机同步已关闭")
+		return
+	_net_sync = script.new()
+	_net_sync.name = "NetSync"
+	add_child(_net_sync)
+	_net_sync.setup(_player, self)
+
+
+## 联机同步层（可能为 null）。
+func net_sync():
+	return _net_sync
 
 
 ## 当前所在世界索引（0 = 门外虚空 / 1 = 门内世界）。
