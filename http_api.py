@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 
 import flask
@@ -20,6 +21,10 @@ import flask
 import config
 
 log = logging.getLogger(__name__)
+
+## 后台 HTTP 服务的句柄（给 s3 启动、s4 关闭用）
+_server = None
+_server_lock = threading.Lock()
 
 
 def create_app(cfg: config.Config, store, game_server=None) -> flask.Flask:
@@ -89,23 +94,84 @@ def create_app(cfg: config.Config, store, game_server=None) -> flask.Flask:
 
 
 def serve(cfg: config.Config, app: flask.Flask) -> None:
-    """启动 HTTP 服务（阻塞）。生产走 waitress，DEBUG 才用 Werkzeug。"""
+    """启动 HTTP 服务（**阻塞**）。只给单独调试用。"""
+    server = _make_server(cfg, app)
+    try:
+        server.run()
+    finally:
+        _close(server)
+
+
+def start_background(cfg: config.Config, app: flask.Flask) -> None:
+    """s3：后台线程跑 HTTP（非阻塞，幂等）。
+
+    用 ``create_server()`` 而不是 ``serve()``，因为前者返回可关闭的句柄：
+    s4 关闭时必须能把监听断开，否则进程会卡在非 daemon 的 HTTP 线程上退不出去。
+    """
+    global _server
+    with _server_lock:
+        if _server is not None:
+            return
+        server = _make_server(cfg, app)
+        _server = server
+        threading.Thread(
+            target=_run_quietly,
+            args=(server,),
+            name="http",
+            daemon=True,
+        ).start()
+    log.info("HTTP 已监听 %s:%s", cfg.http_bind, cfg.http_port)
+
+
+def shutdown() -> None:
+    """s4：关闭 HTTP 监听（幂等；未启动时调用也安全）。"""
+    global _server
+    with _server_lock:
+        server = _server
+        _server = None
+    if server is not None:
+        _close(server)
+        log.info("HTTP 已停止")
+
+
+def _run_quietly(server) -> None:
+    try:
+        server.run()
+    except Exception:  # noqa: BLE001 - 退出时 close() 会让 run() 抛异常，属正常
+        log.debug("HTTP 服务线程退出", exc_info=True)
+
+
+def _close(server) -> None:
+    try:
+        server.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _make_server(cfg: config.Config, app: flask.Flask):
+    """构造一个可关闭的 HTTP server（生产 waitress，DEBUG 用 Werkzeug）。"""
     if cfg.debug:
         log.warning("DEBUG 模式：HTTP 用 Werkzeug 开发服务器（不要用于生产）")
-        app.run(
-            host=cfg.http_bind,
-            port=cfg.http_port,
-            debug=False,       # reloader 会 fork 进程，和 TCP 服务抢端口，必须关掉
-            use_reloader=False,
+        from werkzeug.serving import make_server
+
+        return make_server(
+            cfg.http_bind,
+            cfg.http_port,
+            app,
             threaded=True,
         )
-        return
 
     try:
-        from waitress import serve as waitress_serve
+        from waitress import create_server
     except ImportError:  # pragma: no cover - 依赖缺失时降级
         log.warning("waitress 未安装，降级为 Werkzeug")
-        app.run(host=cfg.http_bind, port=cfg.http_port, threaded=True)
-        return
+        from werkzeug.serving import make_server
 
-    waitress_serve(app, host=cfg.http_bind, port=cfg.http_port, threads=8)
+        return make_server(cfg.http_bind, cfg.http_port, app, threaded=True)
+
+    return create_server(
+        app,
+        host=cfg.http_bind,
+        port=cfg.http_port,
+        threads=8,
+    )

@@ -6,11 +6,19 @@
     python main.py serve         # 同上
     python main.py tcp           # 只起 TCP 游戏协议
     python main.py http          # 只起 HTTP 发现/健康检查
-    python main.py check         # 自检：配置 / 存储 / 设备密钥 / 依赖
+    python main.py check         # 自检：配置 / 存储 / 设备密钥 / 表结构
     python main.py version
 
-本地不想接数据库时：``DB_BACKEND=memory python main.py``
-（数据只存在内存，重启即消失）。
+启动流程（四个阶段，日志里能一行一行看到）::
+
+    s1 初始化   1. 环境变量写入   2. 数据库游标   3. 套接字创建   4. 注册关闭
+    s2 预热     1. 辅助线程（定时落库 + 防外挂）  2. 套接字绑定端口
+    s3 启动     1. 启动套接字   2. 启动 Flask
+    s4 关闭     1. 最后 game 数据落库   2. 执行注册的关闭（逆序）
+
+数据库不在本地：连接串来自 `.env` 的 ``DATABASE_URL``（远端 PostgreSQL），
+连上时自动执行 ``schema.sql`` 建表（幂等）。
+本地想不接数据库：``DB_BACKEND=memory python main.py``。
 """
 
 from __future__ import annotations
@@ -19,14 +27,17 @@ import argparse
 import logging
 import os
 import secrets
+import signal
 import sys
 import threading
 
 import actions
+import anticheat
 import config
 import device_id as devid
 import game
 import http_api
+import lifecycle
 import protocol
 import server as server_mod
 import store as store_mod
@@ -62,30 +73,84 @@ def setup_logging(debug: bool = False) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 服务装配
+# 服务装配（四阶段）
 # ---------------------------------------------------------------------------
 
 class Service:
-    """一整套依赖的持有者（测试脚本也直接用它）。"""
+    """一整套依赖的持有者；所有装配都发生在 ``s1/s2/s3`` 里。
+
+    ``__init__`` **不碰任何资源**（不连库、不建 socket），
+    这样测试可以先构对象、再决定要不要真启。
+    """
 
     def __init__(self, cfg: config.Config) -> None:
         self.cfg = cfg
+        self.life = lifecycle.Lifecycle("service")
+
+        self.store = None
+        self.users = None
+        self.hub = None
+        self.server: server_mod.GameServer | None = None
+        self.app = None
+
+        self.tcp_enabled = True
+        self.http_enabled = True
+
         self._closed = False
+        self._stop = threading.Event()
+        self._signals_done = False
+
+    # ================================================================== #
+    # s1 初始化
+    # ================================================================== #
+
+    def s1_init(self) -> None:
+        """① 环境变量写入 ② 数据库游标 ③ 套接字创建 ④ 注册关闭。"""
+        self.life.enter("s1", "初始化")
+
+        # --- ① 环境变量写入 -------------------------------------------------
+        written = config.export_env(self.cfg)
+        if written:
+            self.life.step(f"环境变量已写入 {len(written)} 项（{', '.join(written)}）")
+        else:
+            self.life.step("环境变量已是规范值，无需改写")
+
+        # --- ② 数据库游标 ---------------------------------------------------
         self._prepare_secret()
+        self.store = store_mod.build_store(self.cfg)
+        # 最早注册 ⇒ 最后执行：一定要等到服务停了、数据落完了才断库
+        self.life.on_shutdown("store.close", self._close_store)
+        if not self.store.ping():
+            raise SystemExit(
+                "数据库不可用（backend=%s）。请检查 .env 里的 DATABASE_URL：%s"
+                % (self.store.backend_name, cfg_target(self.cfg))
+            )
+        self.life.step(f"数据库已连接：backend={self.store.backend_name}")
 
-        self.store = store_mod.build_store(cfg)
-        self.users = UserBusiness(self.store, cfg.user_name_max_len)
-        self.hub = SessionHub(push_hz=cfg.push_hz, max_connections=cfg.max_connections)
+        self.users = UserBusiness(self.store, self.cfg.user_name_max_len)
+        self.hub = SessionHub(
+            push_hz=self.cfg.push_hz, max_connections=self.cfg.max_connections
+        )
+        self.life.on_shutdown("hub.stop_pusher", self.hub.stop_pusher)
 
-        actions.init(cfg, self.store, self.users, self.hub)
+        # --- ③ 套接字创建（只建不绑，绑在 s2） ------------------------------
+        self.server = server_mod.GameServer(
+            self.cfg, self.store, self.users, self.hub
+        )
+        if self.tcp_enabled:
+            self.server.create_socket()
+            self.life.step("TCP 套接字已创建（尚未绑定端口）")
+        self.life.on_shutdown("server.shutdown", self.server.shutdown)
 
-        game.load_from_store(self.store)
-        game.start_autosave(self.store, cfg.autosave_interval)
+        self.app = http_api.create_app(self.cfg, self.store, self.server)
+        self.life.on_shutdown("http.shutdown", self._shutdown_http)
+        self.life.step(f"HTTP 应用已构造（{self.cfg.http_bind}:{self.cfg.http_port}）")
 
-        self.server = server_mod.GameServer(cfg, self.store, self.users, self.hub)
-        self.app = http_api.create_app(cfg, self.store, self.server)
-
-    # ------------------------------------------------------------------ #
+        # --- ④ 注册关闭（已在上面逐步注册）+ 动作层注入 ----------------------
+        actions.init(self.cfg, self.store, self.users, self.hub)
+        self.life.step(f"已注册动作：{', '.join(sorted(actions.ACTIONS))}")
+        self.life.step(f"关闭回调栈（逆序执行）：{' <- '.join(reversed(self.life.hooks()))}")
+        self.life.done()
 
     def _prepare_secret(self) -> None:
         """设备 ID 签名密钥。
@@ -115,7 +180,109 @@ class Service:
             "然后重启。这个值一旦定下就不要改：设备 ID 由它签名，换了老账号会绑不上。"
         )
 
+    # ================================================================== #
+    # s2 预热
+    # ================================================================== #
+
+    def s2_warmup(self) -> None:
+        """① 加载辅助线程（定时写入 & 防外挂） ② 套接字绑定端口。"""
+        self.life.enter("s2", "预热")
+
+        # --- ① 辅助线程 -----------------------------------------------------
+        # 库里上一进程残留的 online 标记先清掉，否则重启后一堆“幽灵在线”。
+        # 必须在 load 之前：load 会把 online 强制 False 读回内存。
+        try:
+            self.store.mark_all_offline()
+            self.life.step("已清除数据库里残留的在线标记")
+        except Exception:  # noqa: BLE001
+            log.warning("清除在线标记失败（不影响启动）", exc_info=True)
+
+        game.load_from_store(self.store)
+        self.life.step(
+            f"权威数据已载入内存：世界实体 {len(game.world)} 个 / 玩家 {len(game.players)} 条"
+        )
+
+        game.start_autosave(self.store, self.cfg.autosave_interval)
+        self.life.on_shutdown("game.autosave", game.stop_autosave)
+        self.life.step(f"定时落库线程已启动（每 {self.cfg.autosave_interval} 秒）")
+
+        started = anticheat.start(self.store, interval=5.0)
+        self.life.on_shutdown("anticheat.stop", anticheat.stop)
+        self.life.step(
+            "防外挂巡检已启动" if started else "防外挂：暂无规则，巡检线程未启动"
+        )
+
+        # --- ② 套接字绑定端口 -----------------------------------------------
+        if self.tcp_enabled:
+            host, port = self.server.bind()
+            self.life.step(f"TCP 已绑定 {host}:{port}（尚未 accept）")
+        self.life.done()
+
+    # ================================================================== #
+    # s3 启动
+    # ================================================================== #
+
+    def s3_start(self) -> None:
+        """① 启动套接字（accept + 推送） ② 启动 Flask。"""
+        self.life.enter("s3", "启动")
+
+        if self.tcp_enabled:
+            self.server.start()
+            self.hub.start_pusher()
+            self.life.step(
+                f"TCP accept 循环已启动；世界推送 {self.cfg.push_hz} Hz"
+            )
+
+        if self.http_enabled:
+            http_api.start_background(self.cfg, self.app)
+            self.life.step(
+                f"HTTP 已监听 {self.cfg.http_bind}:{self.cfg.http_port}"
+            )
+
+        self.life.done("服务已就绪")
+        log.info("按 Ctrl+C 停止服务")
+
+    # ================================================================== #
+    # s4 关闭
+    # ================================================================== #
+
+    def s4_shutdown(self) -> int:
+        """① 最后 game 数据落库 ② 执行注册的关闭（逆序）。"""
+        if self._closed:
+            return 0
+        self._closed = True
+        self.life.enter("s4", "关闭")
+
+        # --- ① 最后落库 -----------------------------------------------------
+        try:
+            game.stop_autosave()
+            anticheat.stop()
+            if self.store is not None and game.save(self.store):
+                self.life.step("玩家 / 世界数据已落库")
+            else:
+                self.life.step("落库未完成（数据库不可用，已写本地兜底快照）")
+        except Exception:  # noqa: BLE001 - 关不干净也得继续关
+            log.exception("关闭前落库失败")
+
+        # --- ② 执行注册的关闭（逆序） -----------------------------------------
+        failed = self.life.shutdown()
+        self.life.done(f"关闭完毕，失败 {failed} 项" if failed else "已完全关闭")
+        return failed
+
     # ------------------------------------------------------------------ #
+    # 关闭回调
+    # ------------------------------------------------------------------ #
+
+    def _close_store(self) -> None:
+        if self.store is not None:
+            self.store.close()
+
+    def _shutdown_http(self) -> None:
+        http_api.shutdown()
+
+    # ================================================================== #
+    # 自检
+    # ================================================================== #
 
     def check(self) -> bool:
         """自检：不监听端口，只确认各个部件能用。"""
@@ -135,75 +302,100 @@ class Service:
             log.info("设备 ID 自检：正常=%s 篡改被拒=%s", good, not bad)
             ok = ok and good and not bad
 
-        if self.store.ping():
+        if self.store is not None and self.store.ping():
             log.info("存储可用：backend=%s", self.store.backend_name)
         else:
-            log.error("存储不可用：backend=%s", self.store.backend_name)
+            log.error("存储不可用：backend=%s", getattr(self.store, "backend_name", "?"))
             ok = False
+
+        # 表结构（users / player / world / world_item）能不能真读
+        if self.store is not None:
+            try:
+                players = self.store.load_players()
+                world_data = self.store.load_world()
+                log.info(
+                    "表结构就绪：player %d 行 / world_item %d 个 / world %s",
+                    len(players),
+                    len(world_data.get("items") or []),
+                    "有" if world_data.get("world") else "缺",
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.error("表结构校验失败：%s", exc)
+                ok = False
 
         log.info("已注册动作：%s", ", ".join(sorted(actions.ACTIONS)))
         return ok
 
-    # ------------------------------------------------------------------ #
+    # ================================================================== #
+    # 主流程
+    # ================================================================== #
 
-    def run(self, mode: str = "serve") -> None:
-        """启动服务（阻塞）。"""
-        if mode == "check":
-            sys.exit(0 if self.check() else 1)
-
-        if mode in ("serve", "tcp"):
-            self.server.bind()
-            self.hub.start_pusher()
+    def run(self, mode: str = "serve") -> int:
+        """按模式跑 s1→s4（阻塞直到收到停止信号）。"""
+        self.tcp_enabled = mode in ("serve", "tcp")
+        self.http_enabled = mode in ("serve", "http")
 
         try:
-            if mode == "tcp":
-                self.server.serve_forever()
-            elif mode == "http":
-                log.info("HTTP 监听 %s:%s", self.cfg.http_bind, self.cfg.http_port)
-                http_api.serve(self.cfg, self.app)
-            else:
-                threading.Thread(
-                    target=self._serve_http, name="http", daemon=True
-                ).start()
-                self.server.serve_forever()
+            self.s1_init()
+
+            if mode == "check":
+                ok = self.check()
+                return 0 if ok else 1
+
+            self.s2_warmup()
+            self.s3_start()
+            self._wait_for_stop()
+            return 0
+
         except KeyboardInterrupt:
-            log.info("收到中断，正在退出…")
+            log.info("收到中断（Ctrl+C），开始关闭…")
+            return 0
+        except SystemExit:
+            raise
+        except Exception:
+            log.exception("启动失败")
+            return 1
         finally:
-            self.close()
+            self.s4_shutdown()
 
-    def _serve_http(self) -> None:
-        log.info("HTTP 监听 %s:%s", self.cfg.http_bind, self.cfg.http_port)
-        try:
-            http_api.serve(self.cfg, self.app)
-        except Exception:  # noqa: BLE001
-            log.exception("HTTP 服务异常退出")
+    def _wait_for_stop(self) -> None:
+        self._install_signals()
+        self._stop.wait()
+
+    def request_stop(self) -> None:
+        """请求停止（信号处理器 / 测试脚本都调这个）。"""
+        self._stop.set()
+
+    def _install_signals(self) -> None:
+        if self._signals_done:
+            return
+        self._signals_done = True
+        for name in ("SIGINT", "SIGTERM"):
+            sig = getattr(signal, name, None)
+            if sig is None:
+                continue
+            try:
+                signal.signal(sig, self._on_signal)
+            except (ValueError, OSError):
+                pass      # 非主线程 / 不支持的平台，忽略
+
+    def _on_signal(self, signum, _frame) -> None:
+        log.info("收到信号 %s，准备关闭…", signum)
+        self.request_stop()
 
     # ------------------------------------------------------------------ #
 
-    def close(self) -> None:
-        if getattr(self, "_closed", False):
-            return
-        self._closed = True
-        log.info("正在关闭…")
-        try:
-            self.hub.stop_pusher()
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            self.server.shutdown()
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            game.stop_autosave()
-            if game.save(self.store):
-                log.info("退出前已将内存落库")
-        except Exception:  # noqa: BLE001
-            log.exception("退出前落库失败")
-        try:
-            self.store.close()
-        except Exception:  # noqa: BLE001
-            pass
-        log.info("已关闭")
+    def close(self) -> int:
+        """向后兼容：等同于 s4。"""
+        return self.s4_shutdown()
+
+
+def cfg_target(cfg: config.Config) -> str:
+    """把连接串裁成“能打日志”的形状（不泄密码）。"""
+    url = cfg.database_url or ""
+    if "@" in url:
+        return url.split("@", 1)[1]
+    return url or "<未配置>"
 
 
 def build_service(cfg: config.Config | None = None) -> Service:
@@ -244,8 +436,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     log.info("启动中：%s", cfg.describe())
-    build_service(cfg).run(args.command)
-    return 0
+    log.info("数据库目标：%s", cfg_target(cfg))
+    return build_service(cfg).run(args.command)
 
 
 if __name__ == "__main__":

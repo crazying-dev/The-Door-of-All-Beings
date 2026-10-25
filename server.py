@@ -155,6 +155,7 @@ class GameServer:
         self.guard = ReplayGuard(window=cfg.request_time_window)
 
         self._sock: socket.socket | None = None
+        self._bound = False
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._started_at = time.time()
@@ -165,25 +166,52 @@ class GameServer:
     # 生命周期
     # ------------------------------------------------------------------ #
 
-    def bind(self) -> tuple[str, int]:
-        """创建监听套接字（先 bind 再 listen，便于把真实端口告诉调用方）。"""
+    def create_socket(self) -> socket.socket:
+        """s1：**只建 socket，不 bind**。
+
+        先建后绑是为了把“能失败就早失败”的两件事分开：
+        创建 socket 几乎不会失败（句柄用完另说），
+        绑端口才会因“端口被占”失败；而端口要在 s2 才绑。
+        """
+        if self._sock is not None:
+            return self._sock
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((self.cfg.tcp_bind, self.cfg.tcp_port))
-        sock.listen(64)
         self._sock = sock
+        log.debug("TCP 套接字已创建（尚未绑定）")
+        return sock
+
+    def bind(self) -> tuple[str, int]:
+        """s2：绑定端口并 listen（幂等：已绑过就不再绑）。
+
+        绑完就 listen，但**不 accept**：客户端此时连进来会被内核排队，
+        等 s3 启动 accept 循环后一起处理，比“拒绝连接”体验好。
+        """
+        sock = self.create_socket()
+        if not self._bound:
+            sock.bind((self.cfg.tcp_bind, self.cfg.tcp_port))
+            sock.listen(64)
+            self._bound = True
         host, port = sock.getsockname()[:2]
-        log.info("TCP 服务端已监听 %s:%s", host, port)
+        log.info("TCP 服务端已绑定 %s:%s（尚未 accept）", host, port)
         return host, port
 
-    def background(self) -> None:
-        """在后台线程里跑 accept 循环（测试用）。"""
-        if self._sock is None:
-            self.bind()
+    def start(self) -> tuple[str, int]:
+        """s3：后台线程跑 accept 循环；返回实际监听地址。"""
+        host, port = self.bind()
+        if self._thread is not None and self._thread.is_alive():
+            return host, port
+        self._stop.clear()
         self._thread = threading.Thread(
             target=self.serve_forever, name="tcp-accept", daemon=True
         )
         self._thread.start()
+        log.info("TCP accept 循环已启动 %s:%s", host, port)
+        return host, port
+
+    def background(self) -> None:
+        """向后兼容：等同 ``start()``（测试脚本用）。"""
+        self.start()
 
     def serve_forever(self) -> None:
         """accept 循环（阻塞）。"""
@@ -211,6 +239,7 @@ class GameServer:
         self._stop.set()
         sock = self._sock
         self._sock = None
+        self._bound = False
         if sock is not None:
             try:
                 sock.shutdown(socket.SHUT_RDWR)

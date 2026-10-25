@@ -1,40 +1,47 @@
-"""运行时内存权威：世界物品 + 在线玩家，定时落库。
+"""运行时热缓存：世界实体 + 玩家状态。
 
-设计思路（沿原 `my/game.py`，把两个坑修了）：
+**权威在数据库，不在内存。** 这是与旧版最大的区别：
 
-* 内存是**权威**，数据库只是快照；每 ``AUTOSAVE_INTERVAL`` 秒 upsert 一次；
-  落库失败不丢数据，写 ``./tmp/databaseErrordb.json`` 兼底。
-* 读写全走一把 ``RLock``；但 ``snapshot()`` 返回的是**拷贝**，持锁时间极短。
-  （旧版 ``snapshot()`` 直接返回锁对象，游说者完全不知道要做什么，
-  而且遍历时拿着锁、遇到阻塞 IO 会把全服一起卡住。）
-* 每个集合带一个修订号 ``rev``：推送时只带变化的部分，10Hz 全量广播也不肉疼。
+| 旧版 | 现在 |
+|---|---|
+| 内存权威，每 60s 把内存写进库 | 库权威，内存只是缓存；启动从库读回 |
+| 写库直接覆盖 | 写库带 ``rev`` 门禁，落后数据直接被库拒掉 |
+| 落库失败只写本地 JSON | 同样写本地 JSON 兜底，但下次启动以库为准 |
+
+因此“重启会丢数据”不再是真的：重启只会丢掉**未落库的最后几秒**，
+而那些数据本来也不能覆盖库里更新的快照。
 
 ===========================================================================
-world 元素结构（对应表 world_items）
+world 元素结构（对应表 world_item）
 ---------------------------------------------------------------------------
 {
-  "id":     "door_01",  # 全局唯一标识（主键）
-  "kind":   "door",     # door 门 / crate 箱子 / lever 杆 / generic 通用…
-  "pos_x":  12.5,       # 世界坐标 X（米，右为正）
-  "pos_y":  0.0,        # 世界坐标 Y（米，上为正，地面 = 0）
-  "pos_z":  -8.0,       # 世界坐标 Z（米）
-  "yaw":    90.0,       # 绕 Y 轴朝向（度，0 = 正北 / -Z）
-  "state":  "idle",     # idle / moving / open / locked
+  "id": "door_01",      # 全局唯一标识（主键）
+  "world_id": "default", # 所属世界
+  "kind": "door",        # door / crate / lever / generic …
+  "pos_x": 12.5,
+  "pos_y": 0.0,
+  "pos_z": -8.0,
+  "yaw": 90.0,            # 度，0 = 正北 / -Z
+  "state": "idle",
+  "rev": 3,               # 修订号：只有比库里大才能覆盖
+  "updated_at": 1761379200.0,
 }
 
-players 元素结构（对应表 players）
+players 元素结构（对应表 player）
 ---------------------------------------------------------------------------
 {
-  "user_id":   "U10001",  # 账号 ID（主键）
-  "user_name": "勇者",
-  "device_id": "ab cd…",  # 绑定的设备 ID hex
-  "pos_x":     12.5,      # 最后已知位置
-  "pos_y":     0.0,
-  "pos_z":     -8.0,
-  "yaw":       180.0,     # 镜头水平朝向（度）
-  "hp":        100.0,
-  "state":     "moving",  # idle / moving / dead
-  "online":    True,
+  "user_id": "ZWME-2WKQ", # 主键（= users.user_id）
+  "user_name": "勇者",     # 账号名（来自 users 表，只读）
+  "player_name": "勇者",   # 角色名（游戏内显示）
+  "race": "human",         # 种族
+  "device_id": "ab cd…",  # 绑定设备（只在内存里，不落库）
+  "pos_x": 12.5, "pos_y": 0.0, "pos_z": -8.0, "yaw": 180.0,
+  "state": "moving",       # idle / moving / dead
+  "online": True,
+  "hp_max": 100.0, "hp": 88.0,
+  "stamina_max": 100.0, "stamina": 100.0,
+  "mana_max": 100.0, "mana": 100.0,
+  "rev": 7,
   "updated_at": 1761379200.0,
 }
 """
@@ -53,12 +60,14 @@ from typing import Iterator
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# 运行时内存数据
+# 运行时热缓存
 # ---------------------------------------------------------------------------
-world: dict[str, dict] = {}
-players: dict[str, dict] = {}
+world: dict[str, dict] = {}        # item_id -> world_item 行
+players: dict[str, dict] = {}      # user_id -> player 行
+world_meta: dict[str, dict] = {}   # world_id -> world 行
 
 _lock = threading.RLock()
+## 推送用的全局修订号（单调递增，不等于行级 rev）
 _world_rev = 0
 _players_rev = 0
 
@@ -67,9 +76,21 @@ COORD_LIMIT = 100000.0
 ## 允许的玩家状态
 PLAYER_STATES = ("idle", "moving", "dead")
 
+DEFAULT_WORLD = "default"
+DEFAULT_RACE = "human"
+## 三围默认值（上限与当前值都从 100 起）
+DEFAULT_STATS = {
+    "hp_max": 100.0,
+    "hp": 100.0,
+    "stamina_max": 100.0,
+    "stamina": 100.0,
+    "mana_max": 100.0,
+    "mana": 100.0,
+}
+
 
 # ---------------------------------------------------------------------------
-# 读写
+# 归一工具
 # ---------------------------------------------------------------------------
 
 def _norm_yaw(yaw) -> float:
@@ -94,6 +115,35 @@ def _coord(value) -> float | None:
     return out
 
 
+def _num(value, default: float = 0.0) -> float:
+    """宽容取数：非数字 / NaN / inf 都回默认值。"""
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(out):
+        return default
+    return out
+
+
+def _apply_stat(row: dict, key: str, value) -> None:
+    """写一项当前值（hp / stamina / mana），自动夹到 [0, 上限]。
+
+    ``None`` / 空串 = “这次没上报”，保持原值不动（客户端不必每次都带三围）。
+    """
+    if value is None or value == "":
+        return
+    raw = _coord(value)
+    if raw is None:
+        return
+    cap = _num(row.get(f"{key}_max"), 100.0)
+    row[key] = max(0.0, min(cap, raw))
+
+
+# ---------------------------------------------------------------------------
+# 读写
+# ---------------------------------------------------------------------------
+
 @contextmanager
 def snapshot() -> Iterator[tuple[list[dict], list[dict]]]:
     """只读快照：持锁期间拷贝，出来就释放锁。"""
@@ -116,16 +166,33 @@ def mutate():
 
 
 def revisions() -> tuple[int, int]:
-    """(world_rev, players_rev)。"""
+    """(world_rev, players_rev)——推送用的全局序号。"""
     with _lock:
         return _world_rev, _players_rev
 
 
-def bump_world_rev() -> int:
+def _default_world_row() -> dict:
+    return {
+        "id": DEFAULT_WORLD,
+        "name": "众生之门",
+        "seed": 0,
+        "rev": 0,
+    }
+
+
+def _touch_world_rev() -> int:
+    """推世界全局修订号，同时把世界行的 rev 抬到同一高度。"""
     global _world_rev
     with _lock:
         _world_rev += 1
+        meta = world_meta.setdefault(DEFAULT_WORLD, _default_world_row())
+        meta["rev"] = _world_rev
+        meta["updated_at"] = time.time()
         return _world_rev
+
+
+def bump_world_rev() -> int:
+    return _touch_world_rev()
 
 
 def bump_players_rev() -> int:
@@ -140,27 +207,32 @@ def bump_players_rev() -> int:
 # ---------------------------------------------------------------------------
 
 def upsert_item(item: dict) -> dict | None:
-    """新增/更新一个世界物品；字段非法返回 None。"""
+    """新增/更新一个世界物品；字段非法返回 None。每次修改 rev + 1。"""
     item_id = str(item.get("id", "")).strip()
     if not item_id or "|" in item_id:
         return None
     pos = [_coord(item.get(k, 0.0)) for k in ("pos_x", "pos_y", "pos_z")]
     if any(v is None for v in pos):
         return None
-    row = {
-        "id": item_id,
-        "kind": str(item.get("kind", "generic")).strip() or "generic",
-        "pos_x": pos[0],
-        "pos_y": pos[1],
-        "pos_z": pos[2],
-        "yaw": _norm_yaw(item.get("yaw", 0.0)),
-        "state": str(item.get("state", "idle")).strip() or "idle",
-        "updated_at": time.time(),
-    }
+
     with mutate():
+        prev = world.get(item_id) or {}
+        row = {
+            "id": item_id,
+            "world_id": str(item.get("world_id") or prev.get("world_id") or DEFAULT_WORLD),
+            "kind": str(item.get("kind", "generic")).strip() or "generic",
+            "pos_x": pos[0],
+            "pos_y": pos[1],
+            "pos_z": pos[2],
+            "yaw": _norm_yaw(item.get("yaw", 0.0)),
+            "state": str(item.get("state", "idle")).strip() or "idle",
+            "rev": int(prev.get("rev", 0)) + 1,
+            "updated_at": time.time(),
+        }
         world[item_id] = row
-    bump_world_rev()
-    return row
+        result = dict(row)
+    _touch_world_rev()
+    return result
 
 
 def world_payload() -> list[dict]:
@@ -168,20 +240,58 @@ def world_payload() -> list[dict]:
         return [
             {
                 "id": it["id"],
-                "kind": it["kind"],
-                "pos_x": it["pos_x"],
-                "pos_y": it["pos_y"],
-                "pos_z": it["pos_z"],
-                "yaw": it["yaw"],
-                "state": it["state"],
+                "kind": it.get("kind", "generic"),
+                "pos_x": it.get("pos_x", 0.0),
+                "pos_y": it.get("pos_y", 0.0),
+                "pos_z": it.get("pos_z", 0.0),
+                "yaw": it.get("yaw", 0.0),
+                "state": it.get("state", "idle"),
             }
             for it in world.values()
         ]
 
 
+def world_meta_payload() -> dict:
+    """世界元信息（给 ``world`` 动作下发名称 / 种子）。"""
+    with _lock:
+        row = dict(world_meta.get(DEFAULT_WORLD) or _default_world_row())
+    return {
+        "id": row.get("id", DEFAULT_WORLD),
+        "name": row.get("name", ""),
+        "seed": int(row.get("seed", 0) or 0),
+        "rev": int(row.get("rev", 0) or 0),
+    }
+
+
 # ---------------------------------------------------------------------------
 # 玩家
 # ---------------------------------------------------------------------------
+
+def _new_player_row(
+    user_id: str,
+    user_name: str = "",
+    device_id_hex: str = "",
+    race: str = "",
+    player_name: str = "",
+) -> dict:
+    row = {
+        "user_id": user_id,
+        "user_name": user_name or "",
+        "player_name": player_name or user_name or "",
+        "race": race or DEFAULT_RACE,
+        "device_id": device_id_hex or "",
+        "pos_x": 0.0,
+        "pos_y": 0.0,
+        "pos_z": 0.0,
+        "yaw": 0.0,
+        "state": "idle",
+        "online": True,
+        "rev": 0,
+        "updated_at": time.time(),
+    }
+    row.update(DEFAULT_STATS)
+    return row
+
 
 def set_player_state(
     user_id: str,
@@ -193,37 +303,41 @@ def set_player_state(
     yaw,
     hp=None,
     state: str = "idle",
+    stamina=None,
+    mana=None,
 ) -> dict | None:
-    """写入一名玩家的最新状态（坐标非法返回 None）。"""
+    """写入一名玩家的最新状态（坐标非法返回 None）。每次写入 rev + 1。"""
     if not user_id:
         return None
     pos = [_coord(pos_x), _coord(pos_y), _coord(pos_z)]
     if any(v is None for v in pos):
         return None
-    hp_value = _coord(hp) if hp not in (None, "") else 100.0
-    if hp_value is None:
-        hp_value = 100.0
-    row = {
-        "user_id": user_id,
-        "user_name": user_name,
-        "device_id": device_id_hex,
-        "pos_x": pos[0],
-        "pos_y": pos[1],
-        "pos_z": pos[2],
-        "yaw": _norm_yaw(yaw),
-        "hp": max(0.0, min(100.0, hp_value)),
-        "state": state if state in PLAYER_STATES else "idle",
-        "online": True,
-        "updated_at": time.time(),
-    }
+
     with mutate():
-        players[user_id] = row
+        row = players.get(user_id)
+        if row is None:
+            row = _new_player_row(user_id, user_name, device_id_hex)
+            players[user_id] = row
+        row["pos_x"], row["pos_y"], row["pos_z"] = pos[0], pos[1], pos[2]
+        row["yaw"] = _norm_yaw(yaw)
+        if user_name:
+            row["user_name"] = user_name
+        if device_id_hex:
+            row["device_id"] = device_id_hex
+        row["state"] = state if state in PLAYER_STATES else "idle"
+        _apply_stat(row, "hp", hp)
+        _apply_stat(row, "stamina", stamina)
+        _apply_stat(row, "mana", mana)
+        row["online"] = True
+        row["rev"] = int(row.get("rev", 0)) + 1
+        row["updated_at"] = time.time()
+        result = dict(row)
     bump_players_rev()
-    return row
+    return result
 
 
 def remove_player(user_id: str) -> bool:
-    """下线一个玩家（保留历史数据的话改为只置 online=False）。"""
+    """下线一个玩家（直接从缓存移除；归档数据仍在库里）。"""
     with mutate():
         existed = players.pop(user_id, None) is not None
     if existed:
@@ -235,36 +349,34 @@ def enter_world(
     user_id: str,
     user_name: str = "",
     device_id_hex: str = "",
+    race: str = "",
+    player_name: str = "",
 ) -> dict | None:
     """玩家进入世界（注册/登录成功后调）。
 
-    没有行就在原点建一个；已有行（比如上次登录的位置）则保留坐标、
-    只把 ``online`` 置回 True。这样重启后玩家还会出现在上次站的地方。
+    缓存里没有该玩家就用库里的数据（由 ``load_from_store`` 预载）建行；
+    有则保留坐标与三围，只把 ``online`` 置回 True。
+    这样重启后玩家还会出现在上次站的地方。
     """
     if not user_id:
         return None
     with mutate():
         row = players.get(user_id)
         if row is None:
-            row = {
-                "user_id": user_id,
-                "user_name": user_name,
-                "device_id": device_id_hex,
-                "pos_x": 0.0,
-                "pos_y": 0.0,
-                "pos_z": 0.0,
-                "yaw": 0.0,
-                "hp": 100.0,
-                "state": "idle",
-                "online": True,
-                "updated_at": time.time(),
-            }
+            row = _new_player_row(user_id, user_name, device_id_hex, race, player_name)
             players[user_id] = row
         else:
-            row["user_name"] = user_name or row.get("user_name", "")
-            row["device_id"] = device_id_hex or row.get("device_id", "")
+            if user_name:
+                row["user_name"] = user_name
+            if player_name:
+                row["player_name"] = player_name
+            if race:
+                row["race"] = race
+            if device_id_hex:
+                row["device_id"] = device_id_hex
             row["online"] = True
-            row["updated_at"] = time.time()
+        row["rev"] = int(row.get("rev", 0)) + 1
+        row["updated_at"] = time.time()
         result = dict(row)
     bump_players_rev()
     return result
@@ -277,6 +389,7 @@ def mark_offline(user_id: str) -> None:
             return
         row["online"] = False
         row["state"] = "idle"
+        row["rev"] = int(row.get("rev", 0)) + 1
         row["updated_at"] = time.time()
     bump_players_rev()
 
@@ -287,12 +400,19 @@ def players_payload(include_offline: bool = False) -> list[dict]:
             {
                 "user_id": p["user_id"],
                 "user_name": p.get("user_name", ""),
-                "pos_x": p["pos_x"],
-                "pos_y": p["pos_y"],
-                "pos_z": p["pos_z"],
-                "yaw": p["yaw"],
-                "hp": p.get("hp", 100.0),
+                "player_name": p.get("player_name", "") or p.get("user_name", ""),
+                "race": p.get("race", DEFAULT_RACE),
+                "pos_x": p.get("pos_x", 0.0),
+                "pos_y": p.get("pos_y", 0.0),
+                "pos_z": p.get("pos_z", 0.0),
+                "yaw": p.get("yaw", 0.0),
                 "state": p.get("state", "idle"),
+                "hp_max": p.get("hp_max", 100.0),
+                "hp": p.get("hp", 100.0),
+                "stamina_max": p.get("stamina_max", 100.0),
+                "stamina": p.get("stamina", 100.0),
+                "mana_max": p.get("mana_max", 100.0),
+                "mana": p.get("mana", 100.0),
             }
             for p in players.values()
             if include_offline or p.get("online", False)
@@ -304,33 +424,97 @@ def online_count() -> int:
         return sum(1 for p in players.values() if p.get("online", False))
 
 
+def get_player(user_id: str) -> dict | None:
+    with _lock:
+        row = players.get(user_id)
+        return dict(row) if row else None
+
+
 # ---------------------------------------------------------------------------
 # 落库
 # ---------------------------------------------------------------------------
 
 _dump_path = Path(__file__).resolve().parent / "tmp" / "databaseErrordb.json"
+_store = None
+_timer: threading.Timer | None = None
+_interval = 60
+
+## “已经落过库”的修订号：只把比它新的行交给数据库。
+## 没有它的话，什么都没变也会每轮重写一遍全表（库在远端，代价很大），
+## 而且库里 rev 相等的行会被当成“落后”而报一堆假警告。
+_persisted_world_rev = 0
+_persisted_item_revs: dict[str, int] = {}
+_persisted_player_revs: dict[str, int] = {}
 
 
 def save(store=None) -> bool:
-    """把内存快照 upsert 到存储；失败时写本地 JSON 兼底。"""
+    """把**有变化**的行 upsert 到数据库；落后数据会被库拒掉（只记日志，不算失败）。
+
+    判定“有变化”用行级 ``rev``：内存 rev 比“已经落过库的 rev”大才算脏。
+    这样 10Hz 上报的玩家每轮只写自己一行，而挂机的玩家一行也不写。
+    """
     backend = store or _store
     if backend is None:
         log.warning("落库跳过：存储层未初始化")
         return False
-    items, ps = _snapshot_lists()
-    # 在 players 表里 device_id 是外键，空的不能拿去 INSERT（会报 FK 违例）
-    ps = [p for p in ps if p.get("user_id") and p.get("device_id")]
+
+    global _persisted_world_rev, _persisted_item_revs, _persisted_player_revs
+
+    with _lock:
+        all_items, all_players = _snapshot_lists_unlocked()
+        meta = dict(world_meta.get(DEFAULT_WORLD) or _default_world_row())
+        meta["rev"] = max(int(meta.get("rev", 0) or 0), _world_rev)
+        world_row = meta if int(meta.get("rev", 0) or 0) > _persisted_world_rev else None
+        items = [it for it in all_items
+                 if int(it.get("rev", 0) or 0) > _persisted_item_revs.get(it["id"], -1)]
+        ps = [p for p in all_players
+              if p.get("user_id")
+              and int(p.get("rev", 0) or 0) > _persisted_player_revs.get(p["user_id"], -1)]
+
     try:
-        backend.save_snapshot(items, ps)
-        return True
+        world_result = backend.save_world(world_row, items)
+        player_result = backend.save_players(ps)
     except Exception as exc:  # noqa: BLE001 - 落库失败不能拖垮整个服务
         log.error("落库失败，写本地快照：%s", exc)
-        _dump_snapshot(items, ps)
+        _dump_snapshot(all_items, all_players)
         return False
+
+    stale = list(world_result.get("stale") or []) + list(player_result.get("stale") or [])
+    written = int(world_result.get("written") or 0) + int(player_result.get("written") or 0)
+    stale_set = set(str(x) for x in stale)
+
+    # 写入成功的行记下“已落库 rev”；被拒的行**不记**，
+    # 但也不再重试（库里那个值更权威，下一轮仍然会被拒）。
+    with _lock:
+        if world_row and str(world_row["id"]) not in stale_set:
+            _persisted_world_rev = int(world_row.get("rev", 0) or 0)
+        for it in items:
+            if str(it["id"]) not in stale_set:
+                _persisted_item_revs[str(it["id"])] = int(it.get("rev", 0) or 0)
+        for p in ps:
+            if str(p["user_id"]) not in stale_set:
+                _persisted_player_revs[str(p["user_id"])] = int(p.get("rev", 0) or 0)
+
+    if stale:
+        log.warning(
+            "有 %d 条数据落后于数据库，已被拒绝写入（以库为准）：%s",
+            len(stale), ", ".join(str(x) for x in stale[:8]),
+        )
+    if written or stale:
+        log.info("落库：写入 %d 行，落后被拒 %d 行", written, len(stale))
+    else:
+        log.debug("落库：无变化，跳过")
+    return True
+
+
+def _snapshot_lists_unlocked() -> tuple[list[dict], list[dict]]:
+    """同 ``_snapshot_lists()``，但调用方已持锁。"""
+    return ([dict(it) for it in world.values()],
+            [dict(p) for p in players.values()])
 
 
 def _dump_snapshot(items: list[dict] | None = None, ps: list[dict] | None = None) -> None:
-    """数据库不可用时的兼底：全量快照写 ./tmp/databaseErrordb.json。"""
+    """数据库不可用时的兜底：全量快照写 ./tmp/databaseErrordb.json。"""
     try:
         if items is None or ps is None:
             with snapshot() as (snap_items, snap_ps):
@@ -353,36 +537,127 @@ def _dump_snapshot(items: list[dict] | None = None, ps: list[dict] | None = None
 # ---------------------------------------------------------------------------
 # 启动 / 定时落库
 # ---------------------------------------------------------------------------
-_store = None
-_timer: threading.Timer | None = None
-_interval = 60
 
+def load_from_store(store) -> bool:
+    """从数据库载入权威数据（启动阶段 s2）。
 
-def load_from_store(store) -> None:
-    """启动时把 disc 里的世界物品读回内存；玩家表不预载（在线状态由会话决定）。"""
+    * 世界元信息 + 世界实体全部读回；
+    * 玩家全部读回，但 ``online`` 一律强制 False（重启后没人在线）；
+    * 内存里的行级 ``rev`` 全部继承库里的值，下次写入才能正确地只接受领先数据。
+    """
+    global _world_rev, _players_rev
+    global _persisted_world_rev
+    ok = True
+
     try:
-        rows = store.load_world() or []
+        world_data = store.load_world(DEFAULT_WORLD) or {}
     except Exception as exc:  # noqa: BLE001
         log.error("读取世界数据失败：%s", exc)
-        return
+        world_data = {}
+        ok = False
+
+    try:
+        player_rows = store.load_players() or []
+    except Exception as exc:  # noqa: BLE001
+        log.error("读取玩家数据失败：%s", exc)
+        player_rows = []
+        ok = False
+
+    world_row = world_data.get("world") or {}
+    item_rows = world_data.get("items") or []
+
     with mutate():
-        for row in rows:
-            item_id = str(row.get("id", "")).strip()
-            if item_id:
-                world[item_id] = dict(row)
-    bump_world_rev()
-    log.info("已从存储载入 %d 个世界物品", len(rows))
+        world.clear()
+        players.clear()
+        world_meta.clear()
+
+        if world_row.get("id"):
+            world_meta[str(world_row["id"])] = {
+                "id": str(world_row["id"]),
+                "name": str(world_row.get("name") or ""),
+                "seed": int(world_row.get("seed") or 0),
+                "rev": int(world_row.get("rev") or 0),
+            }
+
+        for row in item_rows:
+            item_id = str(row.get("id") or "").strip()
+            if not item_id:
+                continue
+            world[item_id] = {
+                "id": item_id,
+                "world_id": str(row.get("world_id") or DEFAULT_WORLD),
+                "kind": str(row.get("kind") or "generic"),
+                "pos_x": _num(row.get("pos_x")),
+                "pos_y": _num(row.get("pos_y")),
+                "pos_z": _num(row.get("pos_z")),
+                "yaw": _norm_yaw(row.get("yaw")),
+                "state": str(row.get("state") or "idle"),
+                "rev": int(row.get("rev") or 0),
+                "updated_at": _num(row.get("updated_at"), time.time()),
+            }
+
+        for row in player_rows:
+            user_id = str(row.get("user_id") or "").strip()
+            if not user_id:
+                continue
+            new_row = {
+                "user_id": user_id,
+                "user_name": str(row.get("user_name") or ""),
+                "player_name": str(row.get("player_name") or row.get("user_name") or ""),
+                "race": str(row.get("race") or DEFAULT_RACE),
+                "device_id": "",          # 设备不在 player 表里
+                "pos_x": _num(row.get("pos_x")),
+                "pos_y": _num(row.get("pos_y")),
+                "pos_z": _num(row.get("pos_z")),
+                "yaw": _norm_yaw(row.get("yaw")),
+                "state": str(row.get("state") or "idle"),
+                "online": False,           # 重启后没人在线
+                "hp_max": _num(row.get("hp_max"), 100.0),
+                "hp": _num(row.get("hp"), 100.0),
+                "stamina_max": _num(row.get("stamina_max"), 100.0),
+                "stamina": _num(row.get("stamina"), 100.0),
+                "mana_max": _num(row.get("mana_max"), 100.0),
+                "mana": _num(row.get("mana"), 100.0),
+                "rev": int(row.get("rev") or 0),
+                "updated_at": _num(row.get("updated_at"), time.time()),
+            }
+            players[user_id] = new_row
+
+        _world_rev = max(
+            [int(it.get("rev") or 0) for it in world.values()]
+            + [int((world_meta.get(DEFAULT_WORLD) or {}).get("rev") or 0), 0]
+        )
+        _players_rev = max([int(p.get("rev") or 0) for p in players.values()] + [0])
+
+        # 刚从库里读回来的行就是“已落库”的状态，不需要再写一遍
+        _persisted_world_rev = int((world_meta.get(DEFAULT_WORLD) or {}).get("rev") or 0)
+        _persisted_item_revs.clear()
+        _persisted_item_revs.update(
+            {iid: int(it.get("rev") or 0) for iid, it in world.items()}
+        )
+        _persisted_player_revs.clear()
+        _persisted_player_revs.update(
+            {uid: int(p.get("rev") or 0) for uid, p in players.items()}
+        )
+
+    log.info(
+        "已从数据库载入权威数据：世界 %s（rev=%d）/ 实体 %d 个 / 玩家 %d 条",
+        (world_meta.get(DEFAULT_WORLD) or {}).get("name") or DEFAULT_WORLD,
+        _world_rev, len(world), len(players),
+    )
+    return ok
 
 
 def start_autosave(store, interval: int = 60) -> None:
-    """启动定时落库循环（daemon 线程，进程退出自动结束）。"""
+    """启动定时落库循环（daemon 线程，进程退出自动结束）。
+
+    注意：这里**不再**顺手把库里 online 清成 False。
+    那件事必须在 ``load_from_store()`` **之前**做（见 main.py 的 s2），
+    否则会把刚上线的玩家又刷成离线。
+    """
     global _store, _interval
     _store = store
     _interval = max(5, int(interval))
-    try:
-        store.mark_all_offline()
-    except Exception as exc:  # noqa: BLE001
-        log.warning("重置在线标记失败：%s", exc)
     _schedule_next()
     log.info("定时落库已启动（每 %d 秒）", _interval)
 
@@ -408,3 +683,17 @@ def _tick() -> None:
         log.exception("定时落库异常")
     finally:
         _schedule_next()  # 无论成败都排下一轮，避免一次失败终止落库
+
+
+def reset() -> None:
+    """清空热缓存（测试用；不改数据库）。"""
+    global _world_rev, _players_rev, _persisted_world_rev
+    with mutate():
+        world.clear()
+        players.clear()
+        world_meta.clear()
+        _world_rev = 0
+        _players_rev = 0
+        _persisted_world_rev = 0
+        _persisted_item_revs.clear()
+        _persisted_player_revs.clear()

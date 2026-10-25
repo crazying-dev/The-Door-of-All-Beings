@@ -269,10 +269,12 @@ def _account_view(account: dict | None) -> dict | None:
 
 @action("register")
 def handle_register(req, session, ctx) -> bytes:
-    """注册账号。payload 只有 ``<user_name>``，user_id 由服务端生成。"""
+    """注册账号。payload: ``<user_name>[&<race>]``，user_id 由服务端生成。"""
     if not req.has_device:
         return fail("register", E_BAD_DEVICE_ID, "注册必须带合法设备 ID")
-    user_name = req.action_data.strip()
+    parts = [p.strip() for p in req.action_data.split("&")] if req.action_data else []
+    user_name = parts[0] if parts else ""
+    race = parts[1] if len(parts) > 1 else ""
 
     ok_flag, code, info = ctx.users.register(
         user_name,
@@ -289,12 +291,18 @@ def handle_register(req, session, ctx) -> bytes:
         return protocol.encode_fail("register", code, message)
 
     session.bind_account(info["user_id"], info["user_name"])
-    game.enter_world(info["user_id"], info["user_name"], session.device_id_hex)
+    player = game.enter_world(
+        info["user_id"], info["user_name"], session.device_id_hex,
+        race=race, player_name=info["user_name"],
+    )
     ctx.hub.push_event("join", info["user_id"], info["user_name"])
     log.info("%s 注册成功 -> %s", session.describe(), info["user_id"])
     return ok("register", {
         "user_id": info["user_id"],
         "user_name": info["user_name"],
+        "player_id": info["user_id"],
+        "player_name": (player or {}).get("player_name", info["user_name"]),
+        "race": (player or {}).get("race", game.DEFAULT_RACE),
         **_version_block(),
     })
 
@@ -319,12 +327,18 @@ def handle_login(req, session, ctx) -> bytes:
             game.mark_offline(session.user_id)
 
     session.bind_account(info["user_id"], info["user_name"])
-    game.enter_world(info["user_id"], info["user_name"], session.device_id_hex)
+    player = game.enter_world(
+        info["user_id"], info["user_name"], session.device_id_hex,
+        player_name=info["user_name"],
+    )
     ctx.hub.push_event("join", info["user_id"], info["user_name"])
     log.info("%s 登录成功", session.describe())
     return ok("login", {
         "user_id": info["user_id"],
         "user_name": info["user_name"],
+        "player_id": info["user_id"],
+        "player_name": (player or {}).get("player_name", info["user_name"]),
+        "race": (player or {}).get("race", game.DEFAULT_RACE),
         "push_hz": ctx.cfg.push_hz,
         **_version_block(),
     })
@@ -363,15 +377,24 @@ def handle_whoami(req, session, ctx) -> bytes:
 
 @action("state")
 def handle_state(req, session, ctx) -> bytes:
-    """上报自身位置/状态。payload: ``<x>&<y>&<z>&<yaw>&[hp]&[state]``。"""
+    """上报自身位置/状态。
+
+    payload：``<x>&<y>&<z>&<yaw>[&hp][&state][&stamina][&mana]``
+
+    后四段都可省略（客户端不必每次都带三围）。
+    ``state`` 在中间是为了与 v1.1 已有报文完全兼容。
+    """
     need = _require_auth(req, session)
     if need is not None:
         return need
 
     parts = [p.strip() for p in req.action_data.split("&")] if req.action_data else []
     if len(parts) < 4:
-        return fail("state", E_BAD_PAYLOAD, "expect <x>&<y>&<z>&<yaw>[&hp][&state]")
-    parts += [""] * (6 - len(parts))
+        return fail(
+            "state", E_BAD_PAYLOAD,
+            "expect <x>&<y>&<z>&<yaw>[&hp][&state][&stamina][&mana]",
+        )
+    parts += [""] * (8 - len(parts))
 
     row = game.set_player_state(
         session.user_id,
@@ -380,11 +403,17 @@ def handle_state(req, session, ctx) -> bytes:
         parts[0], parts[1], parts[2], parts[3],
         hp=parts[4] or None,
         state=parts[5] or "idle",
+        stamina=parts[6] or None,
+        mana=parts[7] or None,
     )
     if row is None:
         return fail("state", E_BAD_PAYLOAD, "坐标非法")
     session.touch()
-    return ok("state", {"t": int(row["updated_at"]), "seq": game.revisions()[1]})
+    return ok("state", {
+        "t": int(row["updated_at"]),
+        "seq": game.revisions()[1],
+        "rev": int(row.get("rev", 0)),
+    })
 
 
 @action("peers")
@@ -404,11 +433,12 @@ def handle_peers(req, session, ctx) -> bytes:
 
 @action("world")
 def handle_world(req, session, ctx) -> bytes:
-    """拉一次世界物品快照。"""
+    """拉一次世界快照（元信息 + 全部实体）。"""
     world_rev, _ = game.revisions()
     items = game.world_payload()
     session.items_rev = world_rev   # 下一次 PUSH 不用再重复下发
     return ok("world", {
+        "world": game.world_meta_payload(),
         "items": items,
         "world_rev": world_rev,
         "t": int(time.time()),

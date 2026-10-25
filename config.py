@@ -148,3 +148,64 @@ def load_config(env_path: Path | None = None) -> Config:
         autosave_interval=_env_int("AUTOSAVE_INTERVAL", 60),
         user_name_max_len=_env_int("USER_NAME_MAX_LEN", 24),
     )
+
+
+# ---------------------------------------------------------------------------
+# 环境变量回写（启动流程 s1 的第一步）
+# ---------------------------------------------------------------------------
+
+## `export_env()` 会回写进程环境的键（**不含** DATABASE_URL / DEVICE_ID_SECRET）
+ENV_KEYS = (
+    "DB_BACKEND", "DB_POOL_MIN", "DB_POOL_MAX",
+    "HOST", "PORT", "TCP_BIND", "TCP_PORT",
+    "HTTP_BIND", "HTTP_PORT", "DEBUG",
+    "DEVICE_ID_MAX_AGE", "REQUEST_TIME_WINDOW",
+    "MAX_LINE_BYTES", "READ_TIMEOUT", "MAX_CONNECTIONS",
+    "PUSH_HZ", "AUTOSAVE_INTERVAL", "USER_NAME_MAX_LEN",
+)
+
+
+def export_env(cfg: Config) -> list[str]:
+    """把**规范化后**的配置回写 ``os.environ``（s1 初始化第 ① 步）。
+
+    为什么要回写：`.env` 里可以写 ``PORT=5423``、也可以完全不写（默认值），
+    但 ``db.py`` 这类老代码是直接 ``os.getenv`` 的。回写之后，
+    全进程只存在一份值，不会再出现「config 读 5423、别处读默认 3000」的情况。
+
+    注意两点：
+
+    * ``DATABASE_URL`` 不回写：它是连接串，里面带密码，不往子进程环境里复制；
+    * ``DEVICE_ID_SECRET`` 不回写：同理，密钥只在 ``device_id.configure()`` 里存一份内存。
+
+    返回真正发生变化的键（已经是规范值的不算）。
+    """
+    values = {
+        "DB_BACKEND": cfg.db_backend,
+        "DB_POOL_MIN": str(cfg.db_pool_min),
+        "DB_POOL_MAX": str(cfg.db_pool_max),
+        "HOST": cfg.public_host,
+        "PORT": str(cfg.public_port),
+        "TCP_BIND": cfg.tcp_bind,
+        "TCP_PORT": str(cfg.tcp_port),
+        "HTTP_BIND": cfg.http_bind,
+        "HTTP_PORT": str(cfg.http_port),
+        "DEBUG": "1" if cfg.debug else "0",
+        "DEVICE_ID_MAX_AGE": str(cfg.device_id_max_age),
+        "REQUEST_TIME_WINDOW": str(cfg.request_time_window),
+        "MAX_LINE_BYTES": str(cfg.max_line_bytes),
+        "READ_TIMEOUT": str(cfg.read_timeout),
+        "MAX_CONNECTIONS": str(cfg.max_connections),
+        "PUSH_HZ": str(cfg.push_hz),
+        "AUTOSAVE_INTERVAL": str(cfg.autosave_interval),
+        "USER_NAME_MAX_LEN": str(cfg.user_name_max_len),
+    }
+    written: list[str] = []
+    for key in ENV_KEYS:
+        value = values.get(key)
+        if value is None:
+            continue
+        if os.environ.get(key) != value:
+            os.environ[key] = value
+            written.append(key)
+    return written
+

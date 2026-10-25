@@ -203,11 +203,12 @@ def run(verbose: bool = False) -> int:
         device_id_secret="",  # 内存后端允许临时密钥
     )
     service = main_mod.Service(cfg)
-    host, port = service.server.bind()
-    threading.Thread(
-        target=service.server.serve_forever, name="smoke-accept", daemon=True
-    ).start()
-    service.hub.start_pusher()
+    service.http_enabled = False       # 冒烟只测 TCP，不起 HTTP
+    # 四阶段启动（与 python main.py serve 完全同一条路径）
+    service.s1_init()
+    service.s2_warmup()
+    service.s3_start()
+    host, port = service.server.bind()  # 幂等，只为拿到真实端口（cfg 里是 0）
     print(f"服务端已启动 tcp://{host}:{port}（backend=memory）")
 
     a = Client(host, port)

@@ -77,7 +77,7 @@ class user:
         ip: str = "",
     ) -> dict | None:
         """登记/刷新设备行，并返回该设备已绑定的账号（没绑则 None）。"""
-        self.store.register_device(device_id_hex, client_version, platform, ip)
+        self.store.touch_device(device_id_hex, client_version, platform, ip)
         return self.store.account_by_device(device_id_hex)
 
     def account_by_device(self, device_id_hex: str) -> dict | None:
@@ -118,12 +118,12 @@ class user:
                 }
             }
 
-        self.store.register_device(device_id_hex, client_version, platform, ip)
+        self.store.touch_device(device_id_hex, client_version, platform, ip)
 
         for _ in range(self.MAX_ID_ATTEMPTS):
             new_id = generate_user_id()
             try:
-                self.store.create_account(new_id, name, device_id_hex)
+                self.store.create_user(new_id, name, device_id_hex)
             except StoreConflict as exc:
                 if exc.field == "user_name":
                     return False, protocol.E_NAME_TAKEN, {}
@@ -155,14 +155,14 @@ class user:
         if not device_id_hex:
             return False, protocol.E_BAD_DEVICE_ID, {"message": "设备 ID 不能为空"}
 
-        # 先确保设备行存在：players / accounts 都对它建了外键
+        # 先确保设备行存在：player 对 users 有外键
         try:
-            self.store.register_device(device_id_hex)
+            self.store.touch_device(device_id_hex)
         except StoreError:
             log.warning("登录前登记设备失败（不影响登录判定）", exc_info=True)
 
         try:
-            acc = self.store.account_for_login(user_id, device_id_hex)
+            acc = self.store.user_for_login(user_id)
         except StoreError:
             log.exception("登录时存储层报错")
             return False, protocol.E_INTERNAL, {}
@@ -179,7 +179,7 @@ class user:
             return False, protocol.E_ACCOUNT_LOCKED, {}
 
         try:
-            self.store.touch_activity(user_id, device_id_hex)
+            self.store.touch_login(user_id, device_id_hex)
         except StoreError:
             log.warning("刷新登录时间失败（不影响登录）", exc_info=True)
 

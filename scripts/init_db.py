@@ -38,7 +38,7 @@ def main() -> int:
         if not database.ping():
             print("[fail] 数据库连不上")
             return 1
-        print("[ok] 表结构已就绪（devices / accounts / world_items / players）")
+        print("[ok] 表结构已就绪（users / player / world / world_item）")
         return 0
     finally:
         database.close()

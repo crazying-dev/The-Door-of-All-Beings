@@ -148,17 +148,54 @@ PUSH | <topic>  | <json>
 | `ping` | 空 | 否 | 心跳/连通性测试 |
 | `hello` | 空 | 否 | 握手：服务端版本、推送频率、动作表 |
 | `device` | `<fp_hex>&<length>` | 否 | 签发 / 确认设备 ID（见 §5） |
-| `register` | `<user_name>` | 否 | 注册，`user_id` 由**服务端**生成返回 |
+| `register` | `<user_name>[&<race>]` | 否 | 注册，`user_id` 由**服务端**生成返回；`race` 缺省 `human` |
 | `login` | `<user_id>` | 否 | 登录（`action_data` 留空则取第 3 行的 `user_id`） |
 | `logout` | 空 | 否 | 退出登录（连接不断，可再登录） |
 | `whoami` | 空 | 否 | 当前会话账号信息 |
-| `state` | `<x>&<y>&<z>&<yaw>[&hp][&state]` | **是** | 上报自身位置/状态 |
+| `state` | `<x>&<y>&<z>&<yaw>[&hp][&state][&stamina][&mana]` | **是** | 上报自身位置/状态 |
 | `peers` | 空 | **是** | 拉一次在线玩家快照 |
-| `world` | 空 | 否 | 拉一次世界物品快照 |
+| `world` | 空 | 否 | 拉一次世界元信息 + 全部物品快照 |
 | `item` | `<id>&[kind]&<x>&<y>&<z>&<yaw>[&state]` | **是** | 增/改一个世界物品 |
 
 `state` 的 `state` 取值：`idle` / `moving` / `dead`（其他值归为 `idle`）。
-`hp` 限制在 `0..100`，坐标绝对值上限 `100000`（非法坐标回 `BAD_PAYLOAD`）。
+坐标绝对值上限 `100000`（非法坐标回 `BAD_PAYLOAD`）。
+
+后四段全部**可省略**，省略就保持原值：
+
+| 段位 | 字段 | 范围 | 说明 |
+|---|---|---|---|
+| 5 | `hp` | `0 .. hp_max` | 当前生命值，超出会被夹回去 |
+| 6 | `state` | 见上 | 与 v1.1 位置一致（放中间是为了不破坏老报文） |
+| 7 | `stamina` | `0 .. stamina_max` | 当前体力 |
+| 8 | `mana` | `0 .. mana_max` | 当前灵力 |
+
+> 三围上限（`hp_max` / `stamina_max` / `mana_max`）默认都是 100，**客户端目前不能改**（将来由 `admin` 或成长系统改）。
+> 每次上报都会让该玩家的 `rev += 1`，响应里的 `rev` 就是回写给客户端的行修订号。
+
+`state` 响应：
+
+```
+OK | state | {"t":1761379200,"seq":42,"rev":7}
+```
+
+`world` 响应（新增 `world` 元信息）：
+
+```
+OK | world | {"world":{"id":"default","name":"众生之门","seed":0,"rev":5},
+              "items":[{"id":"door_01","kind":"door","pos_x":0,"pos_y":0,"pos_z":-8,
+                        "yaw":90,"state":"idle"}],
+              "world_rev":5,"t":1761379200}
+```
+
+`register` / `login` 响应（新增 `player_id` / `player_name` / `race`）：
+
+```
+OK | login | {"user_id":"ZWME-2WKQ","user_name":"勇者",
+              "player_id":"ZWME-2WKQ","player_name":"勇者","race":"human",
+              "push_hz":10,"server_version":"2.0.0","protocol_version":"1.1"}
+```
+
+> 上面的扩展全部是「可选段 / 新增字段」，**不改协议版本号（仍为 1.1）**，老客户端不改也能跑。
 
 ---
 
@@ -202,9 +239,12 @@ OK | device | {"device_id":"ab12…","length":1024,"issued_at":1761379200,
   "seq": 42,
   "players_rev": 7,
   "players": [
-    {"user_id":"ZWME-2WKQ","user_name":"勇者",
+    {"user_id":"ZWME-2WKQ","user_name":"勇者","player_name":"勇者","race":"human",
      "pos_x":12.5,"pos_y":0.0,"pos_z":-8.0,
-     "yaw":90.0,"hp":100.0,"state":"moving"}
+     "yaw":90.0,"state":"moving",
+     "hp_max":100.0,"hp":100.0,
+     "stamina_max":100.0,"stamina":100.0,
+     "mana_max":100.0,"mana":100.0}
   ],
   "online": 1
 }
@@ -249,12 +289,18 @@ S→C  OK | device | {"device_id":"ab12…(2048 hex)","length":1024,"issued_at":
                      "known":false,"account":null,
                      "server_version":"2.0.0","protocol_version":"1.1"}
 
-C→S  … register | 勇者
+C→S  … register | 勇者&elf
      <device_hex> | 
      …
 
 S→C  OK | register | {"user_id":"ZWME-2WKQ","user_name":"勇者",
+                       "player_id":"ZWME-2WKQ","player_name":"勇者","race":"elf",
                        "server_version":"2.0.0","protocol_version":"1.1"}
+
+C→S  … state | 12.5&0&-8&180&77&moving&33&44
+     …
+
+S→C  OK | state | {"t":1761379200,"seq":2,"rev":2}
 
 S→C  PUSH | event | {"kind":"join","user_id":"ZWME-2WKQ","user_name":"勇者","t":1761379200}
 S→C  PUSH | world | {"t":1761379200.1,"seq":1,"players_rev":1,"players":[…],"online":1}
@@ -287,3 +333,6 @@ S→C  PUSH | world | {"t":1761379200.1,"seq":1,"players_rev":1,"players":[…],
 4. **`device_id` 每次请求占 2KB**：登录后建议第 3 行留空，靠会话身份。
 5. **`register` 的 FAIL 帧装不下 `account`**：设备已绑定时客户端需要再调一次 `device` 取回。
    将来可给 `FAIL` 加一列 JSON（v1.2）。
+6. **读响应必须跳过 `PUSH` 帧**：10Hz 世界快照随时插在响应前面。
+   参考 `scripts/tcp_smoke_test.py::read_frame`（`kind == "PUSH"` 就继续读下一行）；
+   只读一行的客户端会把 PUSH 当响应，然后抱怨「响应里没有 `rev`」。

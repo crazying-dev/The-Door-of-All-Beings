@@ -86,7 +86,12 @@ class Database:
     # ------------------------------------------------------------------ #
 
     def _init_schema(self) -> None:
-        """执行 schema.sql（devices / accounts / world_items / players）。"""
+        """执行 schema.sql（users / player / world / world_item）。
+
+        库在**远端**（`.env` 的 DATABASE_URL），本方法在连接后自动跑一次；
+        schema.sql 本身是幂等的（``CREATE TABLE IF NOT EXISTS`` +
+        ``ADD COLUMN IF NOT EXISTS``），重启/多进程并发跑都不会报错。
+        """
         sql = SCHEMA_PATH.read_text(encoding="utf-8")
         with self.cursor(dict_rows=False) as cur:
             cur.execute(sql)
