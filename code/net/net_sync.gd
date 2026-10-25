@@ -22,9 +22,17 @@ const STATE_INTERVAL := 0.1
 const LERP_SPEED := 8.0
 ## 速度高于这个值就当走路（与服务端 state 字段的两档对齐）。
 const WALK_SPEED := 0.5
+## 移动中给服务端报的动作名。服务端只认 idle / moving / dead，
+## 早期客户端报的 "walk" 会被归成 idle，远端就看不出你在走。
+const MOTION_MOVING := "moving"
+const MOTION_IDLE := "idle"
+## 三围初值（客户端目前还没有成长 / 伤害系统，先用满值上报）。
+const DEFAULT_STAT := 100.0
 
 ## 世界物品快照（首次拉取，以及 world_rev 变化时随 PUSH 下发）。
 signal world_items_received(items: Array)
+## 世界元信息（服务端 `world` 响应新增的 `world` 字段：id / name / seed / rev）。
+signal world_meta_received(meta: Dictionary)
 
 ## 业务层实例。故意不写类型标注：GameApi 上是自定义方法，静态类型成 Node 会报找不到成员。
 var _api = null
@@ -38,6 +46,12 @@ var _accum := 0.0
 var _busy := false
 ## 当前在线人数（含自己）。
 var online_count := 0
+## 本机上报的三围（当前值），后期由战斗 / 成长系统驱动。
+var hp := DEFAULT_STAT
+var stamina := DEFAULT_STAT
+var mana := DEFAULT_STAT
+## 世界元信息（拉 world 时缓下）。
+var world_meta: Dictionary = {}
 
 
 func _ready() -> void:
@@ -70,6 +84,9 @@ func _bootstrap() -> void:
 	var res: Dictionary = await _api.fetch_world()
 	if bool(res.get("ok", false)):
 		var data: Dictionary = res.get("data", {})
+		world_meta = _api.world_meta
+		if not world_meta.is_empty():
+			world_meta_received.emit(world_meta)
 		world_items_received.emit(data.get("items", []))
 	set_process(true)
 
@@ -99,8 +116,8 @@ func _push_state() -> void:
 		yaw = float(_player.call("get_yaw_degrees"))
 	if _player.has_method("get_horizontal_speed"):
 		speed = float(_player.call("get_horizontal_speed"))
-	var motion := "walk" if speed > WALK_SPEED else "idle"
-	var res: Dictionary = await _api.send_state(pos, yaw, 100.0, motion)
+	var motion := MOTION_MOVING if speed > WALK_SPEED else MOTION_IDLE
+	var res: Dictionary = await _api.send_state(pos, yaw, hp, motion, stamina, mana)
 	if bool(res.get("ok", false)):
 		return
 	var code := str(res.get("code", ""))
@@ -179,7 +196,8 @@ func _clear_avatars() -> void:
 func _set_motion(avatar: Node3D, state: String) -> void:
 	if not avatar.has_method("play_motion"):
 		return
-	var motion := "walk" if state == "walk" or state == "run" else "idle"
+	# 服务端只发 idle / moving / dead；walk / run 是早期客户端自己报的旧词，一并兼容。
+	var motion := "walk" if state == "moving" or state == "walk" or state == "run" else "idle"
 	if avatar.has_method("current_motion") and str(avatar.call("current_motion")) == motion:
 		return
 	avatar.call("play_motion", motion)
@@ -224,3 +242,27 @@ func is_online() -> bool:
 
 func local_user_id() -> String:
 	return "" if _api == null else str(_api.user_id)
+
+
+## 网络往返耗时（毫秒，平滑值）；未登录 / 无样本返回 -1。
+func latency_ms() -> float:
+	if _api == null or not bool(_api.authenticated):
+		return -1.0
+	return float(_api.latency_ms())
+
+
+## 当前世界名（来自服务端 `world` 元信息），没拿到返回空串。
+func world_name() -> String:
+	return str(world_meta.get("name", ""))
+
+
+## 最近一次上报回写的行修订号（排错用：能看出自己的数据有没有被服务端收下）。
+func state_rev() -> int:
+	return 0 if _api == null else int(_api.state_rev)
+
+
+## 改本机三围（当前值）。后期由战斗 / 成长系统调用。
+func set_stats(new_hp: float, new_stamina: float, new_mana: float) -> void:
+	hp = clampf(new_hp, 0.0, DEFAULT_STAT)
+	stamina = clampf(new_stamina, 0.0, DEFAULT_STAT)
+	mana = clampf(new_mana, 0.0, DEFAULT_STAT)

@@ -27,6 +27,18 @@ var user_id := ""
 var user_name := ""
 var authenticated := false
 
+## 服务端返回的玩家身份（register / login 响应里的新字段）。
+## `player_id` 目前与 user_id 同值；`player_name` 是游戏内显示名；`race` 是种族 key。
+var player_id := ""
+var player_name := ""
+var race := ""
+
+## 最近一次 `state` 响应回写的行修订号（服务端的 player.rev）。
+var state_rev := 0
+## 上一次 `world` 拉到的世界元信息与修订号（服务端新增的 `world` 字段）。
+var world_meta: Dictionary = {}
+var world_rev := 0
+
 ## hello 拿到的服务端信息。
 var server_version := ""
 var protocol_version := ""
@@ -117,11 +129,21 @@ func ensure_device() -> bool:
 
 # ---------------------------------------------------------------- 账号
 
-func register(new_user_name: String) -> Dictionary:
-	var res: Dictionary = await _call("register", new_user_name, device_hex)
+## 注册。payload 为 `<user_name>[&<race>]`；`race` 缺省时用本机保存的种族。
+func register(new_user_name: String, new_race := "") -> Dictionary:
+	var chosen := new_race.strip_edges()
+	if chosen == "":
+		chosen = AccountStore.read_race()
+	var payload := new_user_name
+	if chosen != "":
+		payload += "&" + chosen
+	var res: Dictionary = await _call("register", payload, device_hex)
 	if bool(res.get("ok", false)):
 		var data: Dictionary = res.get("data", {})
+		_remember_player(data)
 		_mark_authenticated(str(data.get("user_id", "")), str(data.get("user_name", new_user_name)))
+		if race != "":
+			AccountStore.write_race(race)
 	return res
 
 
@@ -129,6 +151,7 @@ func login(login_user_id: String) -> Dictionary:
 	var res: Dictionary = await _call("login", login_user_id, device_hex)
 	if bool(res.get("ok", false)):
 		var data: Dictionary = res.get("data", {})
+		_remember_player(data)
 		_mark_authenticated(str(data.get("user_id", login_user_id)), str(data.get("user_name", "")))
 	return res
 
@@ -138,8 +161,20 @@ func logout() -> Dictionary:
 	if bool(res.get("ok", false)):
 		user_id = ""
 		user_name = ""
+		player_id = ""
+		player_name = ""
 		set_authenticated(false)
 	return res
+
+
+## 从 register / login 的响应里记下玩家身份（旧版服务端没有这三个字段，缺了就保持原值）。
+func _remember_player(data: Dictionary) -> void:
+	if data.has("player_id"):
+		player_id = str(data.get("player_id", "")).strip_edges()
+	if data.has("player_name"):
+		player_name = str(data.get("player_name", "")).strip_edges()
+	if data.has("race"):
+		race = str(data.get("race", "")).strip_edges()
 
 
 func whoami() -> Dictionary:
@@ -180,19 +215,40 @@ func login_with_saved_account() -> bool:
 
 # ---------------------------------------------------------------- 世界
 
-func send_state(pos: Vector3, yaw_degrees: float, hp := 100.0, state := "idle") -> Dictionary:
-	var payload := "%.2f&%.2f&%.2f&%.1f&%.0f&%s" % [
-		pos.x, pos.y, pos.z, yaw_degrees, hp, state,
+## 上报自身状态。payload：`<x>&<y>&<z>&<yaw>[&hp][&state][&stamina][&mana]`。
+## 后四段都是可选的；本方法总是带满，方便服务端落库三围。
+func send_state(
+	pos: Vector3,
+	yaw_degrees: float,
+	hp := 100.0,
+	state := "idle",
+	stamina := 100.0,
+	mana := 100.0,
+) -> Dictionary:
+	var payload := "%.2f&%.2f&%.2f&%.1f&%.0f&%s&%.0f&%.0f" % [
+		pos.x, pos.y, pos.z, yaw_degrees, hp, state, stamina, mana,
 	]
-	return await _call("state", payload)
+	var res: Dictionary = await _call("state", payload)
+	if bool(res.get("ok", false)):
+		var data: Dictionary = res.get("data", {})
+		state_rev = int(data.get("rev", state_rev))
+	return res
 
 
 func fetch_peers() -> Dictionary:
 	return await _call("peers")
 
 
+## 拉世界快照。响应比旧版多了 `world` 元信息（名称 / 种子 / rev）。
 func fetch_world() -> Dictionary:
-	return await _call("world")
+	var res: Dictionary = await _call("world")
+	if bool(res.get("ok", false)):
+		var data: Dictionary = res.get("data", {})
+		world_rev = int(data.get("world_rev", world_rev))
+		var meta: Variant = data.get("world", null)
+		if typeof(meta) == TYPE_DICTIONARY:
+			world_meta = meta
+	return res
 
 
 func upsert_item(item_id: String, kind: String, pos: Vector3, yaw_degrees: float, state := "idle") -> Dictionary:
@@ -204,6 +260,21 @@ func upsert_item(item_id: String, kind: String, pos: Vector3, yaw_degrees: float
 
 func ping() -> Dictionary:
 	return await _call("ping")
+
+
+## 网络往返耗时（毫秒，指数平滑）；-1 表示还没测到（未连接 / 无样本）。
+func latency_ms() -> float:
+	return -1.0 if _tcp == null else float(_tcp.avg_rtt_ms)
+
+
+## 最近一次往返耗时（毫秒，未平滑）；-1 表示还没测到。
+func last_latency_ms() -> float:
+	return -1.0 if _tcp == null else float(_tcp.last_rtt_ms)
+
+
+## 世界名（来自 `world` 动作的元信息），没拿到就返回空串。
+func world_name() -> String:
+	return str(world_meta.get("name", ""))
 
 
 # ---------------------------------------------------------------- 内部

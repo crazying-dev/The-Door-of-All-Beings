@@ -23,7 +23,7 @@ const WIPE_OUT_TIME := 0.75
 ## 门内随机落点的最大半径。半径 30 是「之后那块灵质台」的半径，这里留 8 米余量；
 ## 目前的简化地板远大于 30，所以一定站得住。
 const ARRIVAL_RADIUS := 22.0
-const HINT_TEXT := "WASD 移动   ·   Shift 疾行   ·   空格 跳跃   ·   走近光柱进入门内世界（单向）   ·   Esc 释放鼠标   ·   R 复位   ·   F3 调试面板   ·   H 关闭本说明"
+const HINT_TEXT := "WASD 移动   ·   Shift 疾行   ·   空格 跳跃   ·   走近光柱进入门内世界（单向）   ·   Esc 释放鼠标   ·   R 复位   ·   F3 调试面板（帧率 / 延迟 / 坐标）   ·   H 关闭本说明"
 
 ## 万一 project.godot 里的输入动作丢了，运行时补一份，保证一定操作得起来。
 const FALLBACK_ACTIONS := {
@@ -153,14 +153,23 @@ func _process(delta: float) -> void:
 		_respawn()
 
 	# 调试面板的读数每 0.1 秒刷一次就够了，别每帧都拼字符串。
-	# 面板隐藏时干脆不算，省掉无意义的字符串拼接。
+	# 面板隐藏时干脆不算，省掉无意义的字符串拼接（帧率取的是 Engine 的统计值，代价极低）。
 	_speed_accum += delta
 	if _speed_accum >= 0.1 and _hud != null and _player != null:
 		_speed_accum = 0.0
 		if _hud.is_debug_visible():
+			_hud.set_fps(Engine.get_frames_per_second())
+			_hud.set_latency(_latency_ms())
 			_hud.set_speed(_player.get_horizontal_speed())
 			_hud.set_coords(_player.global_position)
 			_hud.set_facing(_player.get_yaw_degrees())
+
+
+## 当前网络延迟（毫秒，平滑值）。未联机 / 联机层缺失时返回 -1，HUD 会显示“未连接”。
+func _latency_ms() -> float:
+	if _net_sync == null or not _net_sync.has_method("latency_ms"):
+		return -1.0
+	return float(_net_sync.call("latency_ms"))
 
 
 func _unhandled_input(event: InputEvent) -> void:

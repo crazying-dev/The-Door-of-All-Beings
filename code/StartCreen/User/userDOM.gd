@@ -243,7 +243,9 @@ func _goto_next() -> void:
 
 func _register_flow(user_name: String, allow_reissue: bool) -> void:
 	waiteLabel.text = "正在注册用户..."
-	var res: Dictionary = await _api.register(user_name)
+	# 种族由本机保存的偏好带上去（默认 human）；服务端只在注册时接受一次，
+	# 账号已存在的种族不会因登录而被改写。
+	var res: Dictionary = await _api.register(user_name, AccountStore.read_race())
 	if bool(res.get("ok", false)):
 		var data: Dictionary = res.get("data", {})
 		_finish_login(str(data.get("user_name", user_name)), str(data.get("user_id", "")))

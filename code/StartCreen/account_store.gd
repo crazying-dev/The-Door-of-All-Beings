@@ -3,12 +3,21 @@ extends RefCounted
 ##
 ##   user://InstallationUniqueID.bin  设备标识（服务端签发并落库的 UUID 文本）
 ##   user://load.bin                  账号信息（JSON：UserName / UserID）
+##   user://race.txt                  本机选定的种族 key（纯文本，默认 human）
 ##
 ## 单独抽一层的原因：登录流程（userDOM.gd）与确认面板（UserLoaded.gd）都要读它，
 ## 而且旧版本写坏过的内容（例如把 UserID 写成了 null）需要在这里统一兜住。
 
 const DEVICE_PATH := "user://InstallationUniqueID.bin"
 const ACCOUNT_PATH := "user://load.bin"
+## 种族选择单独存一个小文件：账号文件只认 UserName / UserID，
+## 混在一起的话任何一次 write_account() 都会把种族洗掉。
+const RACE_PATH := "user://race.txt"
+
+## 服务端 `game.DEFAULT_RACE` 同值：没选过种族时用它。
+const DEFAULT_RACE := "human"
+## 种族 key 限字母 / 数字 / 下划线，与服务端种族表对齐（human / elf / …）。
+const RACE_PATTERN := "^[a-z0-9_]{1,16}$"
 
 ## 服务端签发的用户 ID 形如 ZWME-2WKQ（4 位 + "-" + 4 位）。
 const USER_ID_PATTERN := "^[A-Z0-9]{4}-[A-Z0-9]{4}$"
@@ -104,3 +113,34 @@ static func is_valid_user_id(user_id: String) -> bool:
 	if re.compile(USER_ID_PATTERN) != OK:
 		return false
 	return re.search(user_id) != null
+
+
+# ---------------------------------------------------------------- 种族
+
+## 读取本机选定的种族 key。未选过 / 内容不合法一律返回 DEFAULT_RACE。
+static func read_race() -> String:
+	var race := read_text(RACE_PATH).to_lower()
+	if race == "" or not is_valid_race(race):
+		return DEFAULT_RACE
+	return race
+
+
+static func write_race(race: String) -> bool:
+	race = race.strip_edges().to_lower()
+	if not is_valid_race(race):
+		push_warning("拒绝写入非法种族 key：%s" % race)
+		return false
+	return write_text(RACE_PATH, race)
+
+
+static func clear_race() -> void:
+	remove_file(RACE_PATH)
+
+
+static func is_valid_race(race: String) -> bool:
+	if race == "":
+		return false
+	var re := RegEx.new()
+	if re.compile(RACE_PATTERN) != OK:
+		return false
+	return re.search(race) != null

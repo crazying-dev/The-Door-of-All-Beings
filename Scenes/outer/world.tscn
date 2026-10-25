@@ -103,7 +103,7 @@ visible = false
 offset_left = 22.0
 offset_top = 20.0
 offset_right = 430.0
-offset_bottom = 124.0
+offset_bottom = 210.0
 mouse_filter = 2
 
 [node name="VBox" type="VBoxContainer" parent="HUD/InfoPanel"]
@@ -126,6 +126,22 @@ theme_override_colors/font_color = Color(0.76, 0.86, 0.96, 0.72)
 theme_override_fonts/font = SubResource("SystemFont_ui")
 theme_override_font_sizes/font_size = 14
 text = "非官方同人 · 仅供学习交流 · 非商业用途"
+
+[node name="Fps" type="Label" parent="HUD/InfoPanel/VBox"]
+layout_mode = 2
+mouse_filter = 2
+theme_override_colors/font_color = Color(0.76, 0.86, 0.96, 0.72)
+theme_override_fonts/font = SubResource("SystemFont_ui")
+theme_override_font_sizes/font_size = 14
+text = "帧率 0 FPS"
+
+[node name="Latency" type="Label" parent="HUD/InfoPanel/VBox"]
+layout_mode = 2
+mouse_filter = 2
+theme_override_colors/font_color = Color(0.76, 0.86, 0.96, 0.72)
+theme_override_fonts/font = SubResource("SystemFont_ui")
+theme_override_font_sizes/font_size = 14
+text = "延迟 —（未连接）"
 
 [node name="Speed" type="Label" parent="HUD/InfoPanel/VBox"]
 layout_mode = 2

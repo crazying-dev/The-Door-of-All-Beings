@@ -3,7 +3,7 @@ extends CanvasLayer
 ## 全部节点的 mouse_filter 都是 IGNORE，绝不抢鼠标事件（否则鼠标视角会被面板吃掉）。
 ##
 ## 默认状态是一块干净的画面，没有任何常驻文字：
-##   F3 —— 显示 / 隐藏左上角调试面板（速度、坐标、朝向）
+##   F3 —— 显示 / 隐藏左上角调试面板（帧率、网络延迟、速度、坐标、朝向）
 ##   H  —— 显示 / 隐藏顶部按键说明
 ##
 ## 这层上有两块白：
@@ -13,10 +13,18 @@ extends CanvasLayer
 ## 八个方位名，从正北开始顺时针。正北 = -Z。
 const COMPASS_NAMES := ["北", "东北", "东", "东南", "南", "西南", "西", "西北"]
 
+## 读数的三档颜色：正常 / 偏坏 / 很坏。
+## 显式给定颜色，而不是“删掉 override”——加了 override 之后不指定颜色是不行的。
+const COLOR_NORMAL := Color(0.76, 0.86, 0.96, 0.72)
+const COLOR_WARN := Color(1.0, 0.84, 0.42, 0.9)
+const COLOR_BAD := Color(1.0, 0.46, 0.42, 0.95)
+
 @onready var _flash: ColorRect = $Flash
 @onready var _wipe: ColorRect = $Wipe
 @onready var _hint: Label = $HintLabel
 @onready var _info_panel: PanelContainer = $InfoPanel
+@onready var _fps_label: Label = $InfoPanel/VBox/Fps
+@onready var _latency_label: Label = $InfoPanel/VBox/Latency
 @onready var _speed_label: Label = $InfoPanel/VBox/Speed
 @onready var _coords_label: Label = $InfoPanel/VBox/Coords
 @onready var _facing_label: Label = $InfoPanel/VBox/Facing
@@ -66,6 +74,34 @@ func _apply_hint() -> void:
 		return
 	_hint.text = _hint_text
 	_hint.visible = _hint_shown and _hint_text != ""
+
+
+## 调试面板：帧率（Engine 给的是上一秒的平均值）。
+## 低于 30 标黄、低于 20 标红，一眼就能看出掉帧。
+func set_fps(value: int) -> void:
+	_fps_label.text = "帧率 %d FPS" % value
+	if value < 20:
+		_fps_label.add_theme_color_override("font_color", COLOR_BAD)
+	elif value < 30:
+		_fps_label.add_theme_color_override("font_color", COLOR_WARN)
+	else:
+		_fps_label.add_theme_color_override("font_color", COLOR_NORMAL)
+
+
+## 调试面板：网络往返耗时（毫秒）。
+## 传 -1（未连接 / 还没测到）时显示一个破折号，不要把 -1ms 这种数字给玩家看。
+func set_latency(milliseconds: float) -> void:
+	if milliseconds < 0.0:
+		_latency_label.text = "延迟 —（未连接）"
+		_latency_label.add_theme_color_override("font_color", COLOR_NORMAL)
+		return
+	_latency_label.text = "延迟 %.0f ms" % milliseconds
+	if milliseconds > 200.0:
+		_latency_label.add_theme_color_override("font_color", COLOR_BAD)
+	elif milliseconds > 80.0:
+		_latency_label.add_theme_color_override("font_color", COLOR_WARN)
+	else:
+		_latency_label.add_theme_color_override("font_color", COLOR_NORMAL)
 
 
 ## 调试面板：水平速度（m/s）。

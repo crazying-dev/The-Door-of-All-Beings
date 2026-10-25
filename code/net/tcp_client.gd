@@ -22,6 +22,8 @@ const ENCRYPTION := "none"
 const MAX_LINE_BYTES := 16384
 ## 单次读的块大小。
 const READ_CHUNK := 8192
+## 往返均值的平滑系数（越大越跟手，越小越平滑）。
+const RTT_SMOOTH := 0.25
 
 ## 一条非 PUSH 帧。
 signal response_received(resp: Dictionary)
@@ -32,6 +34,15 @@ signal connection_changed(connected: bool)
 
 ## 整条请求的超时（含建连与等待响应）。
 var timeout_sec := 12.0
+
+## 往返耗时统计。
+## 注意：等响应是按帧轮询的，所以读数自带 1 帧（约 16ms @60fps）的量化误差。
+## 最近一次请求的往返耗时（毫秒），-1 表示还没有样本。
+var last_rtt_ms := -1.0
+## 往返耗时的指数平滑均值（毫秒），-1 表示还没有样本。
+var avg_rtt_ms := -1.0
+## 已采集的往返样本数。
+var rtt_samples := 0
 
 var _peer := StreamPeerTCP.new()
 var _rx := PackedByteArray()
@@ -84,6 +95,7 @@ func connect_to(host: String, port: int) -> bool:
 			_peer.set_no_delay(true)
 			_rx = PackedByteArray()
 			_inbox.clear()
+			reset_rtt()
 			_connecting = false
 			_set_connected(true)
 			return true
@@ -101,7 +113,23 @@ func disconnect_from_server() -> void:
 	_peer.disconnect_from_host()
 	_rx = PackedByteArray()
 	_inbox.clear()
+	reset_rtt()
 	_set_connected(false)
+
+
+## 清空往返统计（新建 / 断开连接时用）。
+func reset_rtt() -> void:
+	last_rtt_ms = -1.0
+	avg_rtt_ms = -1.0
+	rtt_samples = 0
+
+
+## 记录一次往返耗时并更新平滑均值。
+func _record_rtt(sent_usec: int) -> void:
+	var rtt := float(Time.get_ticks_usec() - sent_usec) / 1000.0
+	last_rtt_ms = rtt
+	rtt_samples += 1
+	avg_rtt_ms = rtt if avg_rtt_ms < 0.0 else lerpf(avg_rtt_ms, rtt, RTT_SMOOTH)
 
 
 func _set_connected(value: bool) -> void:
@@ -117,6 +145,7 @@ func _process(_delta: float) -> void:
 	var status := _peer.get_status()
 	if status != StreamPeerTCP.STATUS_CONNECTED:
 		if _was_connected:
+			reset_rtt()
 			_set_connected(false)
 		return
 
@@ -217,6 +246,7 @@ func _request_once(action: String, action_data: String, device_hex: String, user
 		return _fake_fail("DISCONNECTED", "未连接到服务器")
 
 	_inbox.clear()
+	var sent_usec := Time.get_ticks_usec()
 	var packet := build_packet(action, action_data, device_hex, user_id)
 	var err := _peer.put_data(packet)
 	if err != OK:
@@ -229,6 +259,9 @@ func _request_once(action: String, action_data: String, device_hex: String, user
 			# 已经超时丢掉的老响应不归本次请求，继续等
 			var resp_action := str(resp.get("action", ""))
 			if resp_action == action or resp_action == "-":
+				# 只有真拿到服务端的回复才算一次往返（本地伪失败不计）。
+				if str(resp.get("kind", "")) != "NETWORK_ERROR":
+					_record_rtt(sent_usec)
 				return resp
 			continue
 		if not is_connected_to_server():
