@@ -2,18 +2,19 @@
 
 业务代码不再直接 ``os.getenv``，换部署环境只改 `.env`。
 
+本组件是 **TCP 游戏协议服务**（HTTP 发现接口已拆到独立的 server 组件）。
+
 环境变量一览
 ------------
 ================================  ==========================================
 DATABASE_URL                      PostgreSQL 连接串
 DB_BACKEND                        postgres（默认）/ memory（本地调试、跑测试）
 DB_POOL_MIN / DB_POOL_MAX         连接池上下限（1 / 8）
-HOST                              **对外公布**的地址（HTTP 发现接口下发）
+HOST                              **对外公布**的地址（仅日志与调试直连用，下发由 server 组件负责）
 PORT                              **对外公布**的 TCP 端口（默认 5423）
 TCP_BIND                          TCP 实际监听地址（默认 0.0.0.0）
-HTTP_BIND                          HTTP 实际监听地址（默认 0.0.0.0）
-HTTP_PORT                          HTTP 端口（默认 4231）
-DEBUG                             1/true/on 开启调试（调试时 HTTP 走 Werkzeug）
+TCP_PORT                          TCP 实际监听端口（默认跟随 PORT）
+DEBUG                             1/true/on 开启调试日志
 DEVICE_ID_SECRET                  设备 ID 的 HMAC 密钥（≥32B，服务端签发用）
 DEVICE_ID_MAX_AGE                 device_id 有效期秒数，0 = 永不过期（默认 0）
 REQUEST_TIME_WINDOW               报文时间戳容差秒数（默认 300）
@@ -23,9 +24,9 @@ MAX_CONNECTIONS                   最大并发连接数（默认 256）
 PUSH_HZ                           世界快照推送频率（默认 10）
 AUTOSAVE_INTERVAL                 内存数据落库间隔秒数（默认 60）
 USER_NAME_MAX_LEN                 用户名称最大长度（默认 24）
-==================================  ==========================================
+==================================  ===========================================
 
-注意：`HOST` 只用于「告诉客户端该连哪里」，不再参与「是否启动 TCP」的判断
+注意：`HOST` 只用于日志展示与调试直连，不再参与「是否启动 TCP」的判断
 （旧版把 ``os.getenv("HOST") == 公网IP`` 当开关，出口 IP 一变服务就静默不启动）。
 """
 
@@ -84,8 +85,6 @@ class Config:
     public_port: int
     tcp_bind: str
     tcp_port: int
-    http_bind: str
-    http_port: int
 
     # --- 安全 -----------------------------------------------------------
     device_id_secret: str
@@ -110,7 +109,6 @@ class Config:
         return (
             f"service={SERVICE_VERSION} protocol={PROTOCOL_VERSION} "
             f"tcp={self.tcp_bind}:{self.tcp_port} "
-            f"http={self.http_bind}:{self.http_port} "
             f"public={self.public_host}:{self.public_port} "
             f"db={self.db_backend} push={self.push_hz}Hz"
         )
@@ -135,8 +133,6 @@ def load_config(env_path: Path | None = None) -> Config:
         public_port=public_port,
         tcp_bind=_env_str("TCP_BIND", "0.0.0.0") or "0.0.0.0",
         tcp_port=tcp_port,
-        http_bind=_env_str("HTTP_BIND", "0.0.0.0") or "0.0.0.0",
-        http_port=_env_int("HTTP_PORT", 4231),
         device_id_secret=_env_str("DEVICE_ID_SECRET"),
         device_id_max_age=_env_int("DEVICE_ID_MAX_AGE", 0),
         request_time_window=_env_int("REQUEST_TIME_WINDOW", 300),
@@ -158,7 +154,7 @@ def load_config(env_path: Path | None = None) -> Config:
 ENV_KEYS = (
     "DB_BACKEND", "DB_POOL_MIN", "DB_POOL_MAX",
     "HOST", "PORT", "TCP_BIND", "TCP_PORT",
-    "HTTP_BIND", "HTTP_PORT", "DEBUG",
+    "DEBUG",
     "DEVICE_ID_MAX_AGE", "REQUEST_TIME_WINDOW",
     "MAX_LINE_BYTES", "READ_TIMEOUT", "MAX_CONNECTIONS",
     "PUSH_HZ", "AUTOSAVE_INTERVAL", "USER_NAME_MAX_LEN",
@@ -187,8 +183,6 @@ def export_env(cfg: Config) -> list[str]:
         "PORT": str(cfg.public_port),
         "TCP_BIND": cfg.tcp_bind,
         "TCP_PORT": str(cfg.tcp_port),
-        "HTTP_BIND": cfg.http_bind,
-        "HTTP_PORT": str(cfg.http_port),
         "DEBUG": "1" if cfg.debug else "0",
         "DEVICE_ID_MAX_AGE": str(cfg.device_id_max_age),
         "REQUEST_TIME_WINDOW": str(cfg.request_time_window),

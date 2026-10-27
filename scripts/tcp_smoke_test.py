@@ -197,13 +197,11 @@ def run(verbose: bool = False) -> int:
         db_backend="memory",
         tcp_bind="127.0.0.1",
         tcp_port=0,
-        http_port=0,
         autosave_interval=3600,
         push_hz=10,
         device_id_secret="",  # 内存后端允许临时密钥
     )
     service = main_mod.Service(cfg)
-    service.http_enabled = False       # 冒烟只测 TCP，不起 HTTP
     # 四阶段启动（与 python main.py serve 完全同一条路径）
     service.s1_init()
     service.s2_warmup()

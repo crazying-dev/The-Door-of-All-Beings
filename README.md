@@ -1,15 +1,16 @@
-# 众生之门 服务端（The Door of All Beings · Server）
+# 众生之门 TCP 游戏服（The Door of All Beings · Socket Server）
 
-TCP 游戏协议 + HTTP 发现接口。无状态设备凭证、**数据库权威 + rev 门槛**、**四阶段启动（s1/s2/s3/s4）**。
+TCP 游戏协议 + 账号 / 世界数据 + **数据库权威 + rev 门槛** + **四阶段启动（s1/s2/s3/s4）**。
+
+HTTP 发现接口已拆到独立组件 **`server`**（仓库 `server` 分支），两边互不依赖、可分别部署与重启。
 
 | 项 | 值 |
 |---|---|
 | 协议版本 | **1.1**（4 行竖线报文，长连接，10Hz 推送） |
 | 服务版本 | **2.0.0** |
-| TCP 游戏端口 | `PORT`（默认 **5423**） |
-| HTTP 发现端口 | `HTTP_PORT`（默认 **4231**） |
+| TCP 游戏端口 | `TCP_PORT`（默认跟随 `PORT`，即 **5423**） |
 | 存储 | PostgreSQL（生产）/ 内存（调试与测试） |
-| 依赖 | Python 3.12 · flask · waitress · psycopg2-binary · python-dotenv |
+| 依赖 | Python 3.12 · psycopg2-binary · python-dotenv |
 
 协议细节全部在 **[`protocol.md`](protocol.md)**（客户端对接看那一份就够）。
 
@@ -36,7 +37,7 @@ uv run scripts/init_db.py      # 建表 / 升级（幂等）
 uv run scripts/migrate_legacy.py --dry-run   # 看一眼旧表有多少行要搬
 uv run scripts/migrate_legacy.py             # 旧表 devices/accounts → users/player（可逆）
 uv run main.py check           # 自检：配置 / 存储 / 设备密钥 / 表结构
-uv run main.py                 # 同时起 TCP 5423 与 HTTP 4231
+uv run main.py                 # 起 TCP 5423（HTTP 发现接口由 server 组件单独跑）
 ```
 
 > ⚠️ `DEVICE_ID_SECRET` **定下来就不要改**。设备 ID 由它签名，
@@ -47,21 +48,20 @@ uv run main.py                 # 同时起 TCP 5423 与 HTTP 4231
 ## 2. 命令行
 
 ```bash
-uv run main.py serve     # TCP + HTTP（默认）
-uv run main.py tcp       # 只起 TCP 游戏协议
-uv run main.py http      # 只起 HTTP 发现 / 健康检查
+uv run main.py serve     # TCP 游戏协议（默认）
+uv run main.py tcp       # 同上（历史别名）
 uv run main.py check     # 自检：配置 / 存储 / 设备密钥 / 动作表
 uv run main.py version   # 打印服务与协议版本
 ```
 
-常用参数：`--debug`（调试日志 + HTTP 走 Werkzeug）、`--backend memory|postgres`。
+常用参数：`--debug`（调试日志）、`--backend memory|postgres`。
 
 ---
 
 ## 3. 代码结构
 
 ```
-server/
+server-socket/
 ├─ main.py          入口：Service 四阶段（s1 初始化 / s2 预热 / s3 启动 / s4 关闭）
 ├─ lifecycle.py     四阶段日志与关闭回调栈（LIFO）
 ├─ config.py        所有配置集中在这里（只从 .env / 环境变量读）
@@ -75,10 +75,9 @@ server/
 ├─ store.py         存储抽象：PostgresStore / MemoryStore（rev 门槛在这里）
 ├─ anticheat.py     防外挂框架（目前 0 条规则，只占位不起线程）
 ├─ db.py            PostgreSQL 连接池 + 自动执行 schema.sql
-├─ http_api.py      HTTP 发现接口 + /healthz（可后台起、可关闭）
 ├─ schema.sql       表结构（幂等，可重复执行）
 ├─ protocol.md      协议规范（客户端对接看这份）
-├─ deploy/          nginx 与 systemd 示例
+├─ deploy/          systemd 示例
 └─ scripts/
    ├─ init_db.py         建表 / 升级
    ├─ migrate_legacy.py  旧表（devices/accounts/players/world_items）迁移，可 --dry-run
@@ -123,13 +122,13 @@ player 三围 + rev 门槛 + JOIN 带回账号名、`mark_all_offline`。
 | `DATABASE_URL` | — | PostgreSQL 连接串 |
 | `DB_BACKEND` | `postgres` | `postgres` / `memory` |
 | `DB_POOL_MIN` / `DB_POOL_MAX` | 1 / 8 | 连接池上下限 |
-| `HOST` / `PORT` | — / 5423 | **对外公布**的地址与 TCP 端口（只给发现接口用） |
+| `HOST` / `PORT` | — / 5423 | **对外公布**的地址（日志与调试直连用；需与 server 组件的下发值一致） |
 | `TCP_BIND` | `0.0.0.0` | TCP 实际监听地址 |
-| `HTTP_BIND` / `HTTP_PORT` | `0.0.0.0` / 4231 | HTTP 监听地址与端口 |
+| `TCP_PORT` | 跟随 `PORT` | TCP 实际监听端口 |
 | `DEVICE_ID_SECRET` | — | 设备 ID 的 HMAC 密钥（≥ 32 字节，**必填**） |
 | `DEVICE_ID_MAX_AGE` | 0 | 设备 ID 有效期（秒），0 = 永不过期 |
 | `REQUEST_TIME_WINDOW` | 300 | 报文时间戳容差（秒） |
-| `DEBUG` | 0 | 1 = 调试日志 + HTTP 走 Werkzeug |
+| `DEBUG` | 0 | 1 = 调试日志 |
 | `MAX_LINE_BYTES` | 16384 | 单行上限（device_id hex 后 2048 字符，勿小于 4096） |
 | `READ_TIMEOUT` | 180 | 连接读超时（秒） |
 | `MAX_CONNECTIONS` | 256 | 最大并发连接数 |
@@ -146,10 +145,10 @@ player 三围 + rev 门槛 + JOIN 带回账号名、`mark_all_offline`。
 
 | 阶段 | 标题 | 做什么 |
 |---|---|---|
-| s1 | 初始化 | ① 配置回写环境变量 ② 准备 `DEVICE_ID_SECRET`、建存储（连不上直接退出）、`ping()` 探活、账号与推送线程 ③ 建 socket（**只建不绑**）、建 Flask app ④ 动作表就绪，打印关闭回调栈 |
+| s1 | 初始化 | ① 配置回写环境变量 ② 准备 `DEVICE_ID_SECRET`、建存储（连不上直接退出）、`ping()` 探活、账号与推送线程 ③ 建 socket（**只建不绑**） ④ 动作表就绪，打印关闭回调栈 |
 | s2 | 预热 | ① `mark_all_offline()` ② `game.load_from_store()` 全量载入热缓存 ③ 起自动落库定时器、起防外挂 ④ `bind()` 绑端口（**尚未 accept**） |
-| s3 | 启动 | ① `tcp-accept` 线程开始收连接、10Hz 推送线程启动 ② waitress 后台跑 HTTP |
-| s4 | 关闭 | ① 停定时器与防外挂 ② **最后落库** ③ 逆序执行关闭回调（hub → server → http → store） |
+| s3 | 启动 | ① `tcp-accept` 线程开始收连接、10Hz 推送线程启动 |
+| s4 | 关闭 | ① 停定时器与防外挂 ② **最后落库** ③ 逆序执行关闭回调（hub → server → store） |
 
 这样安排的原因：**s1 不碰端口也不碰连接池以外的资源**，`main.py check` 可以直接跑 s1 然后退出，
 不会占用 5423；而「加载完数据才 bind」保证客户端一连上就能看到完整世界。
@@ -236,13 +235,13 @@ WHERE player.rev < EXCLUDED.rev
 
 ## 9. 部署
 
-两个示例都在 `deploy/`：
+systemd 示例在 `deploy/`：
 
-- `nginx-the-door-of-bings.conf.example` —— 只反代 HTTP 发现接口（4231）
 - `the-door-of-bings.service.example` —— systemd，`ExecStart=uv run main.py serve`
 
-**TCP 5423 不经 nginx**：nginx 的 stream 模块会把客户端 IP 换成 127.0.0.1，
-服务端就拿不到真实来源了。直接在安全组 / ufw 里放行：
+本组件只监听 TCP，不走 nginx：nginx 的 stream 模块会把客户端 IP 换成 127.0.0.1，
+服务端就拿不到真实来源了。直接在安全组 / ufw 里放行，同时记得把 `HOST` / `PORT`
+配成公网地址，与 server 组件（HTTP 发现）的下发值保持一致：
 
 ```bash
 ufw allow 5423/tcp
@@ -270,3 +269,16 @@ ufw allow 5423/tcp
 | 测试 | 无 | `tcp_smoke_test.py` + `store_check.py` |
 
 旧 `database.py` 兼容层已删除（`users.user` 签名已改成依赖 `Store`，直接 `import users` 即可）。
+
+---
+
+## 11. 与 server 组件（HTTP 发现）的分工
+
+| 职责 | 组件 |
+|---|---|
+| TCP 游戏协议、会话、10Hz 推送 | **本组件（server-socket）** |
+| 账号 / 设备 ID / 世界数据 / PostgreSQL | **本组件（server-socket）** |
+| HTTP 发现接口 / 健康检查 | server（仓库 `server` 分支） |
+
+两边配置各自独立（同名键 `HOST` / `PORT` 含义一致：对外公布的 TCP 地址），
+改了要两边同步，否则客户端会被指到错误的地址。

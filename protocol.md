@@ -10,7 +10,7 @@
 | 项 | 值 |
 |---|---|
 | 协议 | TCP，**长连接**（同一条连接可以连续发多条请求，并持续收推送） |
-| 端口 | `.env` 的 `PORT`（默认 **5423**）；可通过 HTTP `GET /api/v1/endpoint` 查询 |
+| 端口 | `.env` 的 `TCP_PORT`（默认跟随 `PORT`，即 **5423**）；可通过 HTTP 发现服务 `GET /api/v1/endpoint` 查询 |
 | 编码 | UTF-8 文本，`\n` 为唯一帧边界 |
 | 单行上限 | `MAX_LINE_BYTES`（默认 16384 字节），超限 → `TOO_LARGE` |
 | 空闲超时 | `READ_TIMEOUT`（默认 180 秒）无任何上行数据即断开 |
@@ -308,18 +308,20 @@ S→C  PUSH | world | {"t":1761379200.1,"seq":1,"players_rev":1,"players":[…],
 
 ---
 
-## 8. HTTP 旁路（只做发现）
+## 8. HTTP 旁路（只做发现，已拆到独立组件）
 
 游戏通信全走 TCP，HTTP 只回答「客户端该连哪里」。
+本组件（server-socket）**不提供 HTTP 接口**，发现接口由独立的 **server 组件**
+（仓库 `server` 分支，默认监听 4231）承担，路径与响应形状不变：
 
 | 路径 | 说明 |
 |---|---|
 | `GET /` | 服务名与版本 |
-| `GET /api/v1/endpoint` | `{"tcp":{"host":"…","port":5423},"protocol_version":"1.1","service_version":"2.0.0","push_hz":10,"transport":"tcp","encoding":"utf-8"}` |
+| `GET /api/v1/endpoint` | `{"tcp":{"host":"…","port":5423},"protocol_version":"1.1","service_version":"2.0.0","transport":"tcp","encoding":"utf-8"}` |
 | `GET /game/api` | 同上（旧路径，过渡期保留） |
-| `GET /healthz` | 健康检查，含在线人数/包量统计；DB 不可用时返回 503 |
+| `GET /healthz` | 健康检查（仅 HTTP 服务自身，不含游戏服状态） |
 
-`host` / `port` 来自 `.env`（`HOST` / `PORT`），**不再请求 ipify 推断公网 IP**。
+`host` / `port` 来自 server 组件的 `.env`（`HOST` / `PORT`），需与本组件的实际监听地址一致。
 
 ---
 

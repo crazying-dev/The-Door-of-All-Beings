@@ -1,11 +1,10 @@
-"""服务端入口。
+"""服务端入口（TCP 游戏协议，不含 HTTP 发现接口）。
 
 用法::
 
-    python main.py               # TCP + HTTP（默认）
+    python main.py               # 启动 TCP 游戏服务（默认）
     python main.py serve         # 同上
-    python main.py tcp           # 只起 TCP 游戏协议
-    python main.py http          # 只起 HTTP 发现/健康检查
+    python main.py tcp           # 同上（历史别名）
     python main.py check         # 自检：配置 / 存储 / 设备密钥 / 表结构
     python main.py version
 
@@ -13,9 +12,10 @@
 
     s1 初始化   1. 环境变量写入   2. 数据库游标   3. 套接字创建   4. 注册关闭
     s2 预热     1. 辅助线程（定时落库 + 防外挂）  2. 套接字绑定端口
-    s3 启动     1. 启动套接字   2. 启动 Flask
+    s3 启动     1. 启动套接字（accept + 推送）
     s4 关闭     1. 最后 game 数据落库   2. 执行注册的关闭（逆序）
 
+HTTP 发现接口已拆到独立的 **server** 组件，两边互不依赖。
 数据库不在本地：连接串来自 `.env` 的 ``DATABASE_URL``（远端 PostgreSQL），
 连上时自动执行 ``schema.sql`` 建表（幂等）。
 本地想不接数据库：``DB_BACKEND=memory python main.py``。
@@ -36,7 +36,6 @@ import anticheat
 import config
 import device_id as devid
 import game
-import http_api
 import lifecycle
 import protocol
 import server as server_mod
@@ -67,9 +66,6 @@ def setup_logging(debug: bool = False) -> None:
     root.handlers.clear()
     root.addHandler(handler)
     root.setLevel(logging.DEBUG if debug else logging.INFO)
-    # waitress / werkzeug 的启动日志太啰嗝，降一级
-    for noisy in ("waitress", "werkzeug"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 # ---------------------------------------------------------------------------
@@ -91,10 +87,6 @@ class Service:
         self.users = None
         self.hub = None
         self.server: server_mod.GameServer | None = None
-        self.app = None
-
-        self.tcp_enabled = True
-        self.http_enabled = True
 
         self._closed = False
         self._stop = threading.Event()
@@ -137,14 +129,9 @@ class Service:
         self.server = server_mod.GameServer(
             self.cfg, self.store, self.users, self.hub
         )
-        if self.tcp_enabled:
-            self.server.create_socket()
-            self.life.step("TCP 套接字已创建（尚未绑定端口）")
+        self.server.create_socket()
+        self.life.step("TCP 套接字已创建（尚未绑定端口）")
         self.life.on_shutdown("server.shutdown", self.server.shutdown)
-
-        self.app = http_api.create_app(self.cfg, self.store, self.server)
-        self.life.on_shutdown("http.shutdown", self._shutdown_http)
-        self.life.step(f"HTTP 应用已构造（{self.cfg.http_bind}:{self.cfg.http_port}）")
 
         # --- ④ 注册关闭（已在上面逐步注册）+ 动作层注入 ----------------------
         actions.init(self.cfg, self.store, self.users, self.hub)
@@ -213,9 +200,8 @@ class Service:
         )
 
         # --- ② 套接字绑定端口 -----------------------------------------------
-        if self.tcp_enabled:
-            host, port = self.server.bind()
-            self.life.step(f"TCP 已绑定 {host}:{port}（尚未 accept）")
+        host, port = self.server.bind()
+        self.life.step(f"TCP 已绑定 {host}:{port}（尚未 accept）")
         self.life.done()
 
     # ================================================================== #
@@ -223,21 +209,14 @@ class Service:
     # ================================================================== #
 
     def s3_start(self) -> None:
-        """① 启动套接字（accept + 推送） ② 启动 Flask。"""
+        """① 启动套接字（accept + 推送）。"""
         self.life.enter("s3", "启动")
 
-        if self.tcp_enabled:
-            self.server.start()
-            self.hub.start_pusher()
-            self.life.step(
-                f"TCP accept 循环已启动；世界推送 {self.cfg.push_hz} Hz"
-            )
-
-        if self.http_enabled:
-            http_api.start_background(self.cfg, self.app)
-            self.life.step(
-                f"HTTP 已监听 {self.cfg.http_bind}:{self.cfg.http_port}"
-            )
+        self.server.start()
+        self.hub.start_pusher()
+        self.life.step(
+            f"TCP accept 循环已启动；世界推送 {self.cfg.push_hz} Hz"
+        )
 
         self.life.done("服务已就绪")
         log.info("按 Ctrl+C 停止服务")
@@ -276,9 +255,6 @@ class Service:
     def _close_store(self) -> None:
         if self.store is not None:
             self.store.close()
-
-    def _shutdown_http(self) -> None:
-        http_api.shutdown()
 
     # ================================================================== #
     # 自检
@@ -332,9 +308,6 @@ class Service:
 
     def run(self, mode: str = "serve") -> int:
         """按模式跑 s1→s4（阻塞直到收到停止信号）。"""
-        self.tcp_enabled = mode in ("serve", "tcp")
-        self.http_enabled = mode in ("serve", "http")
-
         try:
             self.s1_init()
 
@@ -408,14 +381,14 @@ def build_service(cfg: config.Config | None = None) -> Service:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="the-door-of-bings-server",
-        description="众生之门服务端（TCP 游戏协议 + HTTP 发现）",
+        prog="the-door-of-bings-server-socket",
+        description="众生之门 TCP 游戏协议服务（HTTP 发现接口在独立的 server 组件）",
     )
     parser.add_argument(
         "command",
         nargs="?",
         default="serve",
-        choices=["serve", "tcp", "http", "check", "version"],
+        choices=["serve", "tcp", "check", "version"],
         help="要执行的子命令（默认 serve）",
     )
     parser.add_argument("--debug", action="store_true", help="输出调试级日志")

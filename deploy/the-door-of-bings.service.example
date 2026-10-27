@@ -1,9 +1,9 @@
-# 众生之门 服务端 —— systemd 单元模板
-# 使用：cp 到 /etc/systemd/system/the-door-of-bings.service
-#       systemctl daemon-reload && systemctl enable --now the-door-of-bings
+# 众生之门 TCP 游戏服 —— systemd 单元模板
+# 使用：cp 到 /etc/systemd/system/the-door-of-bings-socket.service
+#       systemctl daemon-reload && systemctl enable --now the-door-of-bings-socket
 
 [Unit]
-Description=The Door of All Beings - game server (TCP + HTTP discovery)
+Description=The Door of All Beings - game server (TCP 游戏协议)
 After=network-online.target
 Wants=network-online.target
 
@@ -14,15 +14,15 @@ WorkingDirectory=<WORKDIR>
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONIOENCODING=utf-8
 # 若 uv 不在 PATH 中，改成绝对路径，例如 /root/.local/bin/uv
-# main.py 会同时起 TCP（5423）与 HTTP（4231）
+# 本组件只起 TCP（默认 5423）；HTTP 发现接口是独立的 server 组件
 ExecStart=/usr/bin/env uv run main.py serve
 Restart=always
 RestartSec=3
 # SIGINT 后最多等 20 秒，让 game.save() 把内存落库
 KillSignal=SIGINT
 TimeoutStopSec=20
-StandardOutput=append:/var/log/the-door-of-bings.log
-StandardError=append:/var/log/the-door-of-bings.log
+StandardOutput=append:/var/log/the-door-of-bings-socket.log
+StandardError=append:/var/log/the-door-of-bings-socket.log
 
 [Install]
 WantedBy=multi-user.target
