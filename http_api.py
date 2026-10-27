@@ -4,10 +4,11 @@
 
 * ``host`` / ``port`` **只从 .env 读**，不再请求 api.ipify.org
   （旧版在 import 期拉公网 IP，拉不到就整个进程起不来）；
-* 路径从 ``/game/api`` 改成 ``/api/v1/endpoint``，并额外返回版本与推送频率；
+* 路径从 ``/game/api`` 改成 ``/api/v1/endpoint``，并额外返回版本信息；
 * 新增 ``/healthz``，可直接给负载均衡 / 监控用。
 
-真正的游戏通信全走 TCP（见 `server.py`），HTTP 只做发现。
+本组件只做 HTTP 发现。真正的游戏通信全走 TCP 长连接，
+由独立的 **server-socket** 组件承担，两边互不依赖。
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ _server = None
 _server_lock = threading.Lock()
 
 
-def create_app(cfg: config.Config, store, game_server=None) -> flask.Flask:
+def create_app(cfg: config.Config) -> flask.Flask:
     """构造 Flask 应用。"""
     app = flask.Flask(__name__)
     app.config["JSON_AS_ASCII"] = False
@@ -44,7 +45,6 @@ def create_app(cfg: config.Config, store, game_server=None) -> flask.Flask:
             "port": cfg.public_port,
             "protocol_version": config.PROTOCOL_VERSION,
             "service_version": config.SERVICE_VERSION,
-            "push_hz": cfg.push_hz,
             "transport": "tcp",
             "encoding": "utf-8",
         }
@@ -70,21 +70,13 @@ def create_app(cfg: config.Config, store, game_server=None) -> flask.Flask:
 
     @app.get("/healthz")
     def healthz():
-        db_ok = True
-        try:
-            db_ok = bool(store.ping())
-        except Exception:  # noqa: BLE001 - 探活失败就是 False
-            db_ok = False
         payload = {
-            "ok": db_ok,
-            "db": {"ok": db_ok, "backend": getattr(store, "backend_name", "?")},
+            "ok": True,
             "service_version": config.SERVICE_VERSION,
             "protocol_version": config.PROTOCOL_VERSION,
             "uptime": round(time.time() - started_at, 1),
         }
-        if game_server is not None:
-            payload["runtime"] = game_server.snapshot()
-        return flask.jsonify(payload), (200 if db_ok else 503)
+        return flask.jsonify(payload), 200
 
     @app.errorhandler(404)
     def not_found(_err):

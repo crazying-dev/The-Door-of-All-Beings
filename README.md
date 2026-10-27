@@ -1,118 +1,67 @@
-# 众生之门 服务端（The Door of All Beings · Server）
+# 众生之门 HTTP 发现服务（The Door of All Beings · HTTP Discovery）
 
-TCP 游戏协议 + HTTP 发现接口。无状态设备凭证、**数据库权威 + rev 门槛**、**四阶段启动（s1/s2/s3/s4）**。
+本组件是 **纯 Flask HTTP 服务**：告诉客户端该连哪里 + 健康检查。
+
+游戏本体的 TCP 长连接协议（4 行竖线报文、10Hz 推送、账号 / 设备 / 世界数据）
+已拆分为独立组件 **`server-socket`**（仓库同名分支），两边互不依赖、可分别部署与重启。
 
 | 项 | 值 |
 |---|---|
-| 协议版本 | **1.1**（4 行竖线报文，长连接，10Hz 推送） |
+| 协议版本 | **1.1**（仅随发现接口下发，供客户端做兼容提示） |
 | 服务版本 | **2.0.0** |
-| TCP 游戏端口 | `PORT`（默认 **5423**） |
-| HTTP 发现端口 | `HTTP_PORT`（默认 **4231**） |
-| 存储 | PostgreSQL（生产）/ 内存（调试与测试） |
-| 依赖 | Python 3.12 · flask · waitress · psycopg2-binary · python-dotenv |
+| HTTP 监听 | `HTTP_BIND:HTTP_PORT`（默认 `127.0.0.1:4231`） |
+| 依赖 | Python 3.12 · flask · waitress · python-dotenv |
 
-协议细节全部在 **[`protocol.md`](protocol.md)**（客户端对接看那一份就够）。
+TCP 协议细节在 **server-socket 组件的 `protocol.md`**（客户端对接看那一份就够）。
 
 ---
 
 ## 1. 快速开始
 
-### 1.1 本地跑起来（不接数据库）
-
 ```bash
-cp .env.example .env      # Windows: copy .env.example .env
-# .env 里写一行 DEVICE_ID_SECRET=<32+ 字节随机>
-uv run main.py --backend memory
+cp .env.example .env   # Windows: copy .env.example .env
+uv run main.py         # 起 HTTP 发现服务（默认 4231）
 ```
 
-`--backend memory` 时数据只在内存，重启即清空；`DEVICE_ID_SECRET` 会临时生成（仅内存后端允许）。
-
-### 1.2 生产跑起来（接 PostgreSQL）
-
-```bash
-cp .env.example .env
-python -c "import secrets;print(secrets.token_hex(32))"   # 填进 DEVICE_ID_SECRET
-uv run scripts/init_db.py      # 建表 / 升级（幂等）
-uv run scripts/migrate_legacy.py --dry-run   # 看一眼旧表有多少行要搬
-uv run scripts/migrate_legacy.py             # 旧表 devices/accounts → users/player（可逆）
-uv run main.py check           # 自检：配置 / 存储 / 设备密钥 / 表结构
-uv run main.py                 # 同时起 TCP 5423 与 HTTP 4231
-```
-
-> ⚠️ `DEVICE_ID_SECRET` **定下来就不要改**。设备 ID 由它签名，
-> 换了密钥所有老客户端存的 device_id 全部失效，老账号再也绑不上。
+`.env` 里唯一要注意的是 `HOST` / `PORT`：这是**下发给客户端的 TCP 游戏服地址**
+（server-socket 组件对外监听的公网地址），本组件自己不连接它。
 
 ---
 
 ## 2. 命令行
 
 ```bash
-uv run main.py serve     # TCP + HTTP（默认）
-uv run main.py tcp       # 只起 TCP 游戏协议
-uv run main.py http      # 只起 HTTP 发现 / 健康检查
-uv run main.py check     # 自检：配置 / 存储 / 设备密钥 / 动作表
-uv run main.py version   # 打印服务与协议版本
+uv run main.py         # 启动 HTTP 发现服务（默认 serve）
+uv run main.py serve   # 同上
+uv run main.py check   # 自检：配置 / HOST 是否已配置
+uv run main.py version # 打印服务与协议版本
 ```
 
-常用参数：`--debug`（调试日志 + HTTP 走 Werkzeug）、`--backend memory|postgres`。
+常用参数：`--debug`（调试日志 + HTTP 走 Werkzeug）。
 
 ---
 
-## 3. 代码结构
+## 3. 接口
+
+| 路径 | 说明 |
+|---|---|
+| `GET /` | 服务信息与可用路径 |
+| `GET/POST /api/v1/endpoint` | 发现接口：返回 TCP 游戏服 host/port、协议与服务版本 |
+| `GET/POST /game/api` | 旧客户端发现路径，保留一个版本周期做过渡 |
+| `GET /healthz` | 健康检查（uptime + 版本），可直接给负载均衡 / 监控用 |
+
+---
+
+## 4. 代码结构
 
 ```
 server/
-├─ main.py          入口：Service 四阶段（s1 初始化 / s2 预热 / s3 启动 / s4 关闭）
-├─ lifecycle.py     四阶段日志与关闭回调栈（LIFO）
+├─ main.py          入口：初始化 / 启动 / 关闭（阶段名沿用 s1/s3/s4）
+├─ lifecycle.py     阶段日志与关闭回调栈（LIFO）
 ├─ config.py        所有配置集中在这里（只从 .env / 环境变量读）
-├─ protocol.py      协议 v1.1：解析 / 编码 / 错误码
-├─ server.py        TCP 监听（create_socket → bind → start）、帧读取、单连接线程、防重放
-├─ session.py       长连接会话（Session）与会话表 + 10Hz 推送线程（SessionHub）
-├─ actions.py       动作注册表（@action），业务入口
-├─ users.py         账号业务：设备登记 / 注册 / 登录
-├─ device_id.py     设备 ID 的签发与无状态校验（HMAC）
-├─ game.py          热缓存：世界物品 + 玩家行（rev 逐行递增），增量落库
-├─ store.py         存储抽象：PostgresStore / MemoryStore（rev 门槛在这里）
-├─ anticheat.py     防外挂框架（目前 0 条规则，只占位不起线程）
-├─ db.py            PostgreSQL 连接池 + 自动执行 schema.sql
-├─ http_api.py      HTTP 发现接口 + /healthz（可后台起、可关闭）
-├─ schema.sql       表结构（幂等，可重复执行）
-├─ protocol.md      协议规范（客户端对接看这份）
-├─ deploy/          nginx 与 systemd 示例
-└─ scripts/
-   ├─ init_db.py         建表 / 升级
-   ├─ migrate_legacy.py  旧表（devices/accounts/players/world_items）迁移，可 --dry-run
-   ├─ tcp_smoke_test.py  协议冒烟测试（无需数据库）
-   └─ store_check.py     PostgreSQL 存储层校验（跑完自清理）
+├─ http_api.py      Flask 应用：发现接口 + /healthz（可后台起、可关闭）
+└─ deploy/          nginx 与 systemd 示例
 ```
-
----
-
-## 4. 校验与测试
-
-服务端没有引入 pytest：两个脚本都是零额外依赖，退出码 0 = 全绿。
-
-```bash
-# 协议全链路（内存后端，起真 TCP，不用数据库）
-uv run scripts/tcp_smoke_test.py          # 当前 75/75
-uv run scripts/tcp_smoke_test.py -v       # 逐条打印
-
-# PostgreSQL 存储层（用真库，但只碰自己造的临时数据，跑完清理）
-uv run scripts/store_check.py             # 当前 25/25
-
-# 配自检（真实生产环境跑这条最合适）
-uv run main.py check
-```
-
-`tcp_smoke_test.py` 覆盖：握手 / 设备签发与确认 / 注册 / 登录 / 重放去重 /
-哈希篡改 / 时间戳过期 / 未知动作 / 设备伪造 / 10Hz PUSH / 双客户端同屏 / 断线下线。
-
-`store_check.py` 覆盖：users 唯一冲突归类（设备 / user_id / user_name）、SAVEPOINT 回滚不污染事务、
-登录查询与活跃时间、world + world_item 落库与 **rev 门槛三态**（落后被拒 / 相等被拒 / 领先写入）、
-player 三围 + rev 门槛 + JOIN 带回账号名、`mark_all_offline`。
-
-> 读取响应时**必须跳过 `PUSH` 帧**：10Hz 推送随时插在响应前面，
-> 只读一行的客户端会把 PUSH 当响应。参考 `scripts/tcp_smoke_test.py::read_frame`。
 
 ---
 
@@ -120,153 +69,31 @@ player 三围 + rev 门槛 + JOIN 带回账号名、`mark_all_offline`。
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `DATABASE_URL` | — | PostgreSQL 连接串 |
-| `DB_BACKEND` | `postgres` | `postgres` / `memory` |
-| `DB_POOL_MIN` / `DB_POOL_MAX` | 1 / 8 | 连接池上下限 |
-| `HOST` / `PORT` | — / 5423 | **对外公布**的地址与 TCP 端口（只给发现接口用） |
-| `TCP_BIND` | `0.0.0.0` | TCP 实际监听地址 |
+| `HOST` | — | **对外公布**的 TCP 游戏服地址（只给发现接口下发用） |
+| `PORT` | 5423 | **对外公布**的 TCP 端口（同上） |
 | `HTTP_BIND` / `HTTP_PORT` | `0.0.0.0` / 4231 | HTTP 监听地址与端口 |
-| `DEVICE_ID_SECRET` | — | 设备 ID 的 HMAC 密钥（≥ 32 字节，**必填**） |
-| `DEVICE_ID_MAX_AGE` | 0 | 设备 ID 有效期（秒），0 = 永不过期 |
-| `REQUEST_TIME_WINDOW` | 300 | 报文时间戳容差（秒） |
 | `DEBUG` | 0 | 1 = 调试日志 + HTTP 走 Werkzeug |
-| `MAX_LINE_BYTES` | 16384 | 单行上限（device_id hex 后 2048 字符，勿小于 4096） |
-| `READ_TIMEOUT` | 180 | 连接读超时（秒） |
-| `MAX_CONNECTIONS` | 256 | 最大并发连接数 |
-| `PUSH_HZ` | 10 | 世界快照推送频率 |
-| `AUTOSAVE_INTERVAL` | 60 | 内存落库间隔（秒） |
-| `USER_NAME_MAX_LEN` | 24 | 用户名称最大长度 |
 
 ---
 
-## 6. 启动流程（s1 → s2 → s3 → s4）
-
-`main.py::Service` 把启动拆成四个阶段，每阶段失败都能定位到具体步骤；
-关闭时**逆序**执行注册的清理回调（LIFO），单条失败不影响其它回调。
-
-| 阶段 | 标题 | 做什么 |
-|---|---|---|
-| s1 | 初始化 | ① 配置回写环境变量 ② 准备 `DEVICE_ID_SECRET`、建存储（连不上直接退出）、`ping()` 探活、账号与推送线程 ③ 建 socket（**只建不绑**）、建 Flask app ④ 动作表就绪，打印关闭回调栈 |
-| s2 | 预热 | ① `mark_all_offline()` ② `game.load_from_store()` 全量载入热缓存 ③ 起自动落库定时器、起防外挂 ④ `bind()` 绑端口（**尚未 accept**） |
-| s3 | 启动 | ① `tcp-accept` 线程开始收连接、10Hz 推送线程启动 ② waitress 后台跑 HTTP |
-| s4 | 关闭 | ① 停定时器与防外挂 ② **最后落库** ③ 逆序执行关闭回调（hub → server → http → store） |
-
-这样安排的原因：**s1 不碰端口也不碰连接池以外的资源**，`main.py check` 可以直接跑 s1 然后退出，
-不会占用 5423；而「加载完数据才 bind」保证客户端一连上就能看到完整世界。
-
-日志会逐条打印 `[s1] 初始化`、`[s2] 预热` … 便于线上定位卡在哪一步。
-
----
-
-## 7. 数据模型（数据库 v2）
-
-只有四张表，**库是唯一权威**。
-
-| 表 | 主键 | 说明 |
-|---|---|---|
-| `users` | `device_id` | 设备 + 账号。`user_id` / `user_name` 未注册时为 `NULL`（PG 的 UNIQUE 允许多个 NULL） |
-| `player` | `user_id` | 玩家数据，**一条玩家一行**：名字 / 种族 / 坐标 / 朝向 / 在线 / 三围（`hp` / `stamina` / `mana` 及各自 `_max`） |
-| `world` | `id` | 世界元信息：名称 / 随机种子，默认一行 `default` = 众生之门 |
-| `world_item` | `id` | 世界实体（门 / 箱子 / 杆…），`world_id` 外键 |
-
-- `admin` 表**暂不建**，只在 `schema.sql` 末尾留了设计注释（`admin_id` / `pass_hash` / `role` + 审计表）。
-- 表名用 `users` 而不是 `user`（`user` 是 PG 保留字）。
-- 每张业务表都带 `rev BIGINT`：**行级修订号**，既是增量落库的依据，也是冲突仲裁的依据。
-
-### 7.1 只有「领先数据」能进库
-
-所有 upsert 都带 `<表>.rev < EXCLUDED.rev` 门槛：
-
-```sql
-ON CONFLICT (user_id) DO UPDATE SET … , rev = EXCLUDED.rev
-WHERE player.rev < EXCLUDED.rev
-```
-
-| 内存 rev vs 库 rev | 结果 |
-|---|---|
-| 更大 | 写入（`rowcount = 1`），库被推进 |
-| 相等 | **不写**（`rowcount = 0`，计入 `stale`） |
-| 更小 | 不写，计入 `stale`，记 WARNING「以库为准」 |
-
-`game.py` 里还有一层「已落库修订号」（`_persisted_world_rev` / `_persisted_item_revs` / `_persisted_player_revs`）：
-只有 `rev` 比它大的行才提交，所以挂机玩家一行也不写、10Hz 上报的玩家每轮只写自己那一行，
-库在远端也不会被打爆。
-
----
-
-## 8. 设计要点
-
-### 8.1 设备 ID：服务端签发，无状态校验
-
-设备 ID 是一张 **1024 字节的「签名票据」**，结构：
-
-```
-[ver(2)][lenFlag(2)][ts(4)][nonce(32)][fp(16)][tag(32)][HKDF 扩展(N)]
-```
-
-- `tag = HMAC-SHA256(DEVICE_ID_SECRET, ver|lenFlag|ts | nonce | fp)`
-- 最后一大段扩展由 `tag` 派生，因此**改任意一个字节都校验不过**
-- 校验只看自身 HMAC，**不查库、不建会话**
-- 客户端**不持密钥**（自己签等于把密钥发给全世界，且泄露后无法回收）
-
-一个设备只能绑一个账号，一个账号永久绑首次登记的设备（不做设备迁移）。
-
-### 8.2 热缓存 + 增量落库（数据库才是权威）
-
-内存里的 `world` / `players` 只是**热缓存**，不是权威源：
-
-- `state` 动作只改内存（不做 DB IO，10Hz 上报也不怕），每行 `rev += 1`
-- 每 `AUTOSAVE_INTERVAL` 秒只把**脏行**（`rev` 超过已落库值的行）upsert 一次；退出前在 s4 再存一次
-- 库里 rev 更大 ⇒ 该行被拒，日志 WARNING「以库为准」，**不重试**（等下次上报带来更大的 rev）
-- 落库失败不丢数据，写 `tmp/databaseErrordb.json` 兜底
-- 重启加载时 `online` 一律强制 `False`（s2 之前已经 `mark_all_offline()`）
-
-### 8.3 长连接 + 10Hz 推送
-
-- 一个 TCP 连接 = 一个 `Session`，刚连上是匿名的，`login`/`register` 后绑定账号
-- `SessionHub` 单线程按 `PUSH_HZ` 广播，世界快照每 tick 只构造一次
-- 同账号多会话时，最后一个断开才算下线（`has_user` 判定）
-
-### 8.4 防重放（有局限）
-
-`ReplayGuard` 按「会话 + 时间戳 + 正文 sha256」去重，只拦 `register` / `device` / `item` 这类写动作。
-**跨连接重放挡不住**——协议目前没有 nonce 字段。详见 `protocol.md` §9。
-
----
-
-## 9. 部署
+## 6. 部署
 
 两个示例都在 `deploy/`：
 
-- `nginx-the-door-of-bings.conf.example` —— 只反代 HTTP 发现接口（4231）
+- `nginx-the-door-of-bings.conf.example` —— 反代本服务的 HTTP 发现接口（4231）
 - `the-door-of-bings.service.example` —— systemd，`ExecStart=uv run main.py serve`
 
-**TCP 5423 不经 nginx**：nginx 的 stream 模块会把客户端 IP 换成 127.0.0.1，
-服务端就拿不到真实来源了。直接在安全组 / ufw 里放行：
-
-```bash
-ufw allow 5423/tcp
-```
+TCP 5423 **不经 nginx**（由 server-socket 组件监听），在安全组 / ufw 里直接放行即可。
 
 ---
 
-## 10. 与旧版的差异（1.x → 2.0）
+## 7. 与 server-socket 组件的分工
 
-旧版是 `app/` 下的 Flask + WebSocket 结构，2.0 彻底换掉：
+| 职责 | 组件 |
+|---|---|
+| HTTP 发现接口 / 健康检查 | **本组件（server）** |
+| TCP 游戏协议、会话、10Hz 推送 | server-socket |
+| 账号 / 设备 ID / 世界数据 / PostgreSQL | server-socket |
 
-| 方面 | 旧（≤ 1.x） | 新（2.0） |
-|---|---|---|
-| 游戏通道 | WebSocket `/ws/world` | **原生 TCP 4 行协议**，长连接 |
-| 权限模型 | Cookie / 会话 | 协议头自带 device_id + 会话绑定 |
-| `user_id` | 客户端生成 | **服务端生成**（`ZWME-2WKQ`） |
-| device_id | 客户端自签（持密钥） | **服务端签发**，客户端只存不用算 |
-| 发现接口 | `/game/api`（import 期请求 ipify） | `/api/v1/endpoint`（host/port 只读 `.env`） |
-| 启动条件 | `HOST` == 公网 IP 才启动 | **永远启动**，`HOST` 只用于下发 |
-| 帧读取 | `recv(65536)` 一次 | 带缓冲的行读取器（切包/粘包/2048 字符全 OK） |
-| 事务 | 就地捕 UniqueViolation（事务已 aborted） | `SAVEPOINT` + `ROLLBACK TO SAVEPOINT` |
-| 权威源 | 内存（定时覆盖库） | **数据库**，只有领先数据能进库 |
-| 启动 | 一把梭 `main()` | 四阶段 s1/s2/s3/s4，关闭回调 LIFO |
-| 错误响应 | 裸文本 | 统一 `FAIL \| action \| code \| message` |
-| 测试 | 无 | `tcp_smoke_test.py` + `store_check.py` |
-
-旧 `database.py` 兼容层已删除（`users.user` 签名已改成依赖 `Store`，直接 `import users` 即可）。
+两边配置各自独立（同名键 `HOST` / `PORT` 含义一致：对外公布的 TCP 地址）。
+改了 `HOST` / `PORT` 时记得两边同步，否则客户端会被指到错误的地址。

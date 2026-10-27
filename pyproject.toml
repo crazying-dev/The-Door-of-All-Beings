@@ -1,18 +1,17 @@
 [project]
 name = "the-door-of-bings-server"
 version = "2.0.0"
-description = "众生之门（The Door of All Beings）服务端：TCP 游戏协议 + HTTP 发现接口"
+description = "众生之门（The Door of All Beings）HTTP 发现服务：端点下发 + 健康检查"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "flask>=3.0.0",
-    "psycopg2-binary>=2.9.9",
     "python-dotenv>=1.0.1",
     "waitress>=3.0.0",
 ]
 
 # 本项目是应用而非库：不要让 uv 尝试构建包。
 # 注意：因此不能用 [project.scripts] 提供命令别名（uv 的入口点表要求项目被构建并安装）；
-# 一键运行请直接传脚本路径，例如 `uv run main.py`、`uv run scripts/init_db.py`。
+# 一键运行请直接传脚本路径，例如 `uv run main.py`。
 [tool.uv]
 package = false
