@@ -1,11 +1,13 @@
 extends Control
 ## 启动页的用户登录控制（Scenes/start/StartCreen.tscn 的 User 节点）。
 ##
-## 协议 v1.1（规范见 server/protocol.md）：一条 TCP 长连接 + 4 行竖线报文。
+## 协议 v1.2（规范见 server-socket/protocol.md 与 flows.md）：一条 TCP 长连接 + 4 行竖线报文。
 ## 与旧版 HTTP 时代的差别：
-##   · 不再有 /api/v1/register、/api/v1/verify，全部走 socket 动作（device / register / login）
+##   · 不再有 /api/v1/register、/api/v1/verify，全部走 socket 动作（device / check_name / register / login）
 ##   · 设备标识由**服务端签发**，本机只负责原样保存（user://InstallationUniqueID.bin）
-##   · user_id 由**服务端生成**，注册只提交 user_name
+##   · user_id 由**服务端生成**，注册提交 `<user_name>&<race>&<player_id>`
+##   · player_id 由**本机生成**（RFC 4122 v4 UUID，user://player_id.txt），服务端另存一份
+##   · 会话 Token 由 TcpClient 自动维护，本脚本不需要关心
 ##
 ## 设备锁规则不变：一个设备只能绑定一个账号；账号一旦绑定就不能更换、不能换设备登录。
 ##
@@ -13,7 +15,7 @@ extends Control
 ##   1. 建连 + hello 握手（失败重试 CONNECT_MAX_ATTEMPT 次）
 ##   2. 申请 / 复用设备标识（顺带取回该设备已绑定的账号）
 ##   3. 再次登录：login（服务端重新校验 设备 + 用户 ID 一致）
-##   4. 首次登录：register（只提交用户名称，ID 由服务端生成）
+##   4. 首次登录：check_name 查重 -> register（提交名称 + 种族 + 本机 UUID）
 ##   5. 用 EndLoadUser(UserIsLoaded) 通知确认面板显示 / 隐藏
 ##   6. 本机已有登录凭证（本地账号文件 / 服务端找回）：跳过 Yes/No 确认，直接进入下一个场景
 ##      —— 即使凭证已失效、服务端校验不通过，也照样放行；
@@ -243,6 +245,10 @@ func _goto_next() -> void:
 
 func _register_flow(user_name: String, allow_reissue: bool) -> void:
 	waiteLabel.text = "正在注册用户..."
+	# v1.2 新增动作 check_name：注册前先查重，避免用户填完才被告知重名。
+	# 老服务端没这个动作（回 UNKNOWN_ACTION）时视作「查不了」，直接进注册。
+	if not await _name_available(user_name):
+		return
 	# 种族由本机保存的偏好带上去（默认 human）；服务端只在注册时接受一次，
 	# 账号已存在的种族不会因登录而被改写。
 	var res: Dictionary = await _api.register(user_name, AccountStore.read_race())
@@ -267,6 +273,28 @@ func _register_flow(user_name: String, allow_reissue: bool) -> void:
 			waiteLabel.text = _friendly(res, "账号已被锁定，暂时无法注册")
 		_:
 			waiteLabel.text = _friendly(res, "注册失败，请稍后重试")
+
+
+## 注册前的名称查重（协议 v1.2 的 check_name）。
+## 返回 true = 继续进注册（含「查不了」的情况）；返回 false = 已把提示写进 waiteLabel。
+## 服务端把「格式非法」也算不可用，用 data.reason 区分（taken / invalid）。
+func _name_available(user_name: String) -> bool:
+	var res: Dictionary = await _api.check_name(user_name)
+	if not bool(res.get("ok", false)):
+		# UNKNOWN_ACTION（老服务端）/ 超时 / 断线：一律放过，让 register 自己去判
+		return true
+	var data: Dictionary = res.get("data", {})
+	if bool(data.get("available", true)):
+		return true
+	match str(data.get("reason", "")):
+		"taken":
+			waiteLabel.text = "该用户名称已被占用，请换一个"
+		"invalid":
+			waiteLabel.text = "用户名称最多 %d 个字符，且不能包含空格、| 、& 或控制字符" % _name_max_len()
+		_:
+			waiteLabel.text = "该用户名称不可用，请换一个"
+	input.grab_focus()
+	return false
 
 
 ## 设备已绑定账号：向 device 取回账号信息并直接登录（找回本地丢失的记录）。

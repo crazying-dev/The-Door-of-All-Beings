@@ -1,29 +1,33 @@
 # 客户端网络层（code/net）
 
-服务端协议见 [server/protocol.md](../../../server/protocol.md)（4 行竖线报文 + 单行长响应 + 10Hz PUSH）。
+服务端协议见 [server-socket/protocol.md](../../../server-socket/protocol.md) 与 [server-socket/flows.md](../../../server-socket/flows.md)
+（协议 **v1.2**：4 行竖线报文 + 单行长响应 + 10Hz PUSH + 会话 Token）。
 
 | 文件 | 类型 | 职责 |
 |---|---|---|
 | `net_config.gd` | RefCounted | 服务端地址的唯一来源：环境变量覆盖 + 生产默认值 |
-| `tcp_client.gd` | Node | 协议层：建连、组包、收帧、串行化请求、超时、往返耗时统计。**不懂业务** |
-| `game_api.gd` | Node | 业务层：hello / device / register / login / state / item / world，并维护本机设备、当前账号、玩家身份与延迟 |
-| `net_sync.gd` | Node | 世界场景的同步层：10Hz 上报 + 消费 PUSH world / event + 远端玩家代理 |
+| `tcp_client.gd` | Node | 协议层：建连、组包、收帧、串行化请求、超时、往返耗时统计、**会话 Token 自动维护**。**不懂业务** |
+| `game_api.gd` | Node | 业务层：hello / device / check_name / register / login / state / item / world，并维护本机设备、当前账号、玩家身份与延迟 |
+| `net_sync.gd` | Node | 世界场景的同步层：10Hz 上报 + 消费 PUSH world / event + 远端玩家代理 + **断线重连** |
 
 ## 启动流程
 
 ```
 StartCreen.tscn / User(userDOM.gd)
-  → GameApi.connect_and_hello()      握手，拿服务端版本 / push_hz / user_name_max_len
+  → GameApi.connect_and_hello()      握手；TCP 建连后先等 `PUSH | token`
   → GameApi.ensure_device()          本地有 hex 就“确认”，没有就申一张（服务端签发）
-  → 本地有账号 ? login(user_id) : register(user_name, race)
+  → 本地有账号 ? login(user_id) : check_name(name) → register(name, race)
   → 进入下一场景（race.tscn → world.tscn）
         → net_sync.setup(player, world)
         → GameApi.login_with_saved_account()   重新建连并静默登录
         → _process 里每 0.1s 上报 state，同时收 PUSH world
+        → 意外断线：5s 宽限期内自动重连 + 重登，失败就静默降级单机
 ```
 
 登录成功后同一连接上的后续请求**不再携带 device / user_id**（身份已记在会话上），
-这样每帧省掉 2KB 的 hex。
+改由服务端下发的**会话 Token** 认人（第 3 行这时变 3 段：`<token> | <device> | <user>`），
+这样每帧省掉 2KB 的 hex。Token 由 `tcp_client` 自动吸收 / 带上，业务层不用管；
+失效时 `game_api._call()` 会自动重登并重试一次（服务端校验在 dispatch 之前，重试安全）。
 
 ## 本地联调
 
@@ -36,13 +40,21 @@ set DB_BACKEND=memory
 uv run main.py serve
 ```
 
-## 与服务端 v2（库权威版）的对齐点
+## 与服务端 v2（协议 v1.2）的对齐点
 
-服务端本次是**向后兼容扩展**，没有升协议号（仍为 1.1）：
+服务端这次是**升了协议号的不兼容变更**：协议 **1.0 / 1.1 / 1.2 都能进**，
+但 v1.2 多了会话 Token、`check_name`、`player_id`、`file_hash` 与断线宽限期。
 
 | 变化 | 客户端对应 |
 |---|---|
-| `register` 支持 `&<race>` | `game_api.register(name, race)`，缺省读 `AccountStore.read_race()`（默认 `human`） |
+| 协议号 `1.2`（`SUPPORTED_VERSIONS = 1.0 / 1.1 / 1.2`） | `tcp_client.PROTOCOL_VERSION = "1.2"` |
+| 建连后服务端主动推 `token` 帧，请求第 3 行可带 token | `tcp_client.session_token` + `_absorb_push_token()`，业务层无感 |
+| token 失效回 `SESSION_TOKEN_EXPIRED` / `BAD_SESSION_TOKEN`，或推 `reset_token` 帧 | `game_api._call()` 自动重登重试一次；`_on_pushed` 收 `reset_token` 重登 |
+| 新增动作 `check_name`（注册前查重） | `game_api.check_name()` + `userDOM._name_available()`；老服务端回 `UNKNOWN_ACTION` 时直接放行 |
+| `register` payload 变 `<user_name>&<race>&<player_id>` | `game_api.register()` 带本机 UUID（`AccountStore.ensure_player_id()`） |
+| `login` payload 改 JSON `{"player_id","file_hash"}` | `game_api._login_no_retry()`；`player_id` 用服务端 `user_id`，`file_hash` 默认不传 |
+| `device` / `check_name` 变纯读，不再 `touch_device` | 客户端可放心重复调用（不会钩 `DUPLICATE_REQUEST`） |
+| 意外断开有 `GRACE_SECONDS`（默认 5s）宽限期 | `net_sync.RECONNECT_WINDOW = 5.0` 内重连 + 重登 |
 | `state` 扩到 8 段（hp / state / stamina / mana） | `game_api.send_state()` 总是带满；`net_sync` 的三围用 `hp` / `stamina` / `mana` 变量 |
 | `state` 响应多了 `rev` | `game_api.state_rev` / `net_sync.state_rev()` |
 | `register` / `login` 响应多了 `player_id` / `player_name` / `race` | `game_api.player_id` / `player_name` / `race` |
@@ -76,6 +88,13 @@ uv run main.py serve
   才能拿回绑定账号，见 `userDOM._adopt_bound_account()`。
 - **`BAD_DEVICE_ID` 自愈**：本地存的 hex 校验不过（换密钥 / 旧版遗留）时，
   `GameApi.ensure_device()` 会自动丢掉本地文件重领一张。
+- **`file_hash` 默认不传**：服务端会把首次提交的值**钉在库里**，之后不一致就回
+  `FILE_HASH_MISMATCH` 拒登。客户端一升级就会把自己锁在外面，所以 `game_api.file_hash`
+  默认空串（空 = 不参与校验），确实要做文件完整性校验时再赋值。
+- **`logout` 后要清本地 token**：服务端的 `handle_logout` 会把本连接 token 作废，
+  客户端不同步清掉，下一条请求就会被回 `SESSION_TOKEN_EXPIRED`。
+- **重连要留在 5s 窗口内**：服务端对意外断开的会话有 `GRACE_SECONDS` 宽限期，窗口内登回去
+  会话与 player 行都还在；超时后才由服务端扫描线程清理。
 - **远端代理**：`net_sync` 实例化 `Scenes/actors/player.tscn`，把 `preview_keys` 关掉
   （不然按 1/2/3 也会切它们的动画），位置是插值过去的，动作按 `state` 字段切 walk / idle
   （`moving` / `walk` / `run` → walk，其余 → idle）。

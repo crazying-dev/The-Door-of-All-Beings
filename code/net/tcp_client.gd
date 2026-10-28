@@ -1,22 +1,31 @@
 extends Node
-## 众生之门 TCP 协议客户端（协议 v1.1，规范见 server/protocol.md）。
+## 众生之门 TCP 协议客户端（协议 v1.2，规范见 server-socket/protocol.md 与 flows.md）。
 ##
 ## 职责边界：只负责「把一条请求发出去、把对应的响应拿回来」，不懂业务。
 ## 业务封装在 game_api.gd；地址在 net_config.gd。
 ##
 ## 设计要点：
-##   * **长连接**：一个 TcpClient 只用一条 TCP，登录后同一连接收 PUSH。
+##   * **长连接**：一个 TcpClient 只用一条 TCP，登录后同一条连接收 PUSH。
 ##   * **串行化**：同一时刻只允许一条请求在路上（服务端回帧不带请求 id，
 ##     并发就会错配），后来的 call 会排队。
 ##   * **不阻塞主线程**：全部用 await process_frame 轮询，不开线程。
 ##   * **每次请求都带客户端版本**（协议头第 5 字段），符合项目约定。
+##   * **会话 Token（v1.2）**：建连后服务端主动推 `PUSH | token`，本类自动存下，
+##     并把它放进后续每条请求的第 3 行。没收到 token 时退回 v1.1 的 2 段写法，
+##     老服务端照样能用。
 
 const AppInfo = preload("res://code/net/app_info.gd")
 
 ## 协议常量（必须与服务端 protocol.py 一致）。
 const MAGIC := "TheDoorOfBings"
-const PROTOCOL_VERSION := "1.1"
+const PROTOCOL_VERSION := "1.2"
 const ENCRYPTION := "none"
+
+## 推送 topic（与 protocol.py 的 TOPIC_* 一致）。
+const TOPIC_TOKEN := "token"
+const TOPIC_RESET_TOKEN := "reset_token"
+## 建连后等 `PUSH | token` 的上限（秒）。超时不算失败，按 v1.1 兼容模式继续。
+const TOKEN_WAIT_SEC := 3.0
 
 ## 单行上限，超过就丢弃缓冲区（服务端默认 16384）。
 const MAX_LINE_BYTES := 16384
@@ -27,10 +36,14 @@ const RTT_SMOOTH := 0.25
 
 ## 一条非 PUSH 帧。
 signal response_received(resp: Dictionary)
-## 服务端主动推送：topic 为 "world" / "event"。
+## 服务端主动推送：topic 为 "world" / "event" / "token" / "reset_token"。
 signal pushed(topic: String, payload: Dictionary)
 ## 连接状态变化。
 signal connection_changed(connected: bool)
+## 服务端下发 / 换发了会话 Token（v1.2）。空串表示已清除。
+signal token_changed(token: String)
+## 服务端要求重置 Token（拿的是旧连接 / 已作废的值，见 flows.md 流程 5）。
+signal token_reset(reason: String)
 
 ## 整条请求的超时（含建连与等待响应）。
 var timeout_sec := 12.0
@@ -43,6 +56,11 @@ var last_rtt_ms := -1.0
 var avg_rtt_ms := -1.0
 ## 已采集的往返样本数。
 var rtt_samples := 0
+
+## 本连接的会话 Token（v1.2）。空串 = 还没有 / 已作废，此时按 v1.1 的 2 段报文发。
+var session_token := ""
+## Token 的参考有效期（秒，服务端下发的 expire；仅用于日志 / 展示）。
+var token_expire := 0
 
 var _peer := StreamPeerTCP.new()
 var _rx := PackedByteArray()
@@ -95,8 +113,12 @@ func connect_to(host: String, port: int) -> bool:
 			_peer.set_no_delay(true)
 			_rx = PackedByteArray()
 			_inbox.clear()
+			session_token = ""
+			token_expire = 0
 			reset_rtt()
 			_connecting = false
+			# 先等 token 再宣告「已连接」：监听者一收到 connection_changed 就会发请求
+			await _await_token()
 			_set_connected(true)
 			return true
 		if status == StreamPeerTCP.STATUS_ERROR or status == StreamPeerTCP.STATUS_NONE:
@@ -113,6 +135,7 @@ func disconnect_from_server() -> void:
 	_peer.disconnect_from_host()
 	_rx = PackedByteArray()
 	_inbox.clear()
+	clear_token()
 	reset_rtt()
 	_set_connected(false)
 
@@ -137,6 +160,56 @@ func _set_connected(value: bool) -> void:
 		return
 	_was_connected = value
 	connection_changed.emit(value)
+
+
+# ---------------------------------------------------------------- 会话 Token
+
+## 有没有可用的会话 Token。
+func has_token() -> bool:
+	return session_token != ""
+
+
+## 服务端回包里回显的 token（login 响应会带一份），外部可直接覆盖。
+func adopt_token(value: String) -> void:
+	_apply_token(value)
+
+
+## 清掉本地 token（拿到 reset_token / 重连前）。
+func clear_token() -> void:
+	if session_token == "" and token_expire == 0:
+		return
+	session_token = ""
+	token_expire = 0
+	token_changed.emit("")
+
+
+func _apply_token(value: String) -> void:
+	value = value.strip_edges()
+	if value == "" or value == session_token:
+		return
+	session_token = value
+	token_changed.emit(value)
+
+
+## 从推送帧里吸收 token / reset_token（两帧都是服务端主动发的）。
+func _absorb_push_token(topic: String, payload: Dictionary) -> void:
+	if topic == TOPIC_TOKEN:
+		token_expire = int(payload.get("expire", 0))
+		_apply_token(str(payload.get("token", "")))
+	elif topic == TOPIC_RESET_TOKEN:
+		# 先清掉再告诉监听者：它直接重登就能拿回新值
+		clear_token()
+		token_reset.emit(str(payload.get("reason", "")))
+
+
+## 等建连后服务端主动推的 `PUSH | token`。
+## 超时不算失败：老服务端（v1.1）根本不发，客户端按 2 段报文继续走。
+func _await_token(timeout := TOKEN_WAIT_SEC) -> void:
+	var deadline := Time.get_ticks_msec() + int(timeout * 1000.0)
+	while session_token == "" and Time.get_ticks_msec() < deadline:
+		await get_tree().process_frame
+	if session_token == "":
+		push_warning("未在 %.1f 秒内收到会话 Token，按 v1.1 兼容模式继续" % timeout)
 
 
 # ---------------------------------------------------------------- 收包
@@ -189,6 +262,7 @@ func _handle_line(line: String) -> void:
 		var push_parts := line.split("|", true, 2)
 		var topic := push_parts[1].strip_edges() if push_parts.size() > 1 else ""
 		var payload := _parse_json(push_parts[2] if push_parts.size() > 2 else "{}")
+		_absorb_push_token(topic, payload)
 		pushed.emit(topic, payload)
 		return
 
@@ -277,8 +351,10 @@ static func _fake_fail(code: String, message: String) -> Dictionary:
 
 # ---------------------------------------------------------------- 组包
 
-## 按协议 v1.1 拼一条 4 行报文。
+## 按协议 v1.2 拼一条 4 行报文。
 ## 哈希必须对「第 2 行原文 + \n + 第 3 行原文」逐字节计算，不要 strip。
+## 第 3 行带 token 时是 3 段（`<token> | <device> | <user>`），
+## 没 token 时退回 v1.1 的 2 段（`<device> | <user>`），服务端两种都认。
 func build_packet(action: String, action_data: String, device_hex: String, user_id: String) -> PackedByteArray:
 	var ts := int(Time.get_unix_time_from_system())
 	var head := "%s | %s | %d | %s | %s | %s | %s" % [
@@ -287,6 +363,8 @@ func build_packet(action: String, action_data: String, device_hex: String, user_
 	]
 	var body1 := "%s | %s" % [action, action_data]
 	var body2 := "%s | %s" % [device_hex, user_id]
+	if session_token != "":
+		body2 = "%s | %s | %s" % [session_token, device_hex, user_id]
 	var digest := sha256_hex(body1 + "\n" + body2)
 	return (head + "\n" + body1 + "\n" + body2 + "\n" + digest + " | " + digest + "\n").to_utf8_buffer()
 

@@ -7,10 +7,12 @@ extends Node
 ##   3. 消费服务端 10Hz 的 PUSH world，把其它玩家渲染成 player.tscn 的线条骨架代理，
 ##      位置做插值，动作按 state 字段切 walk / idle；
 ##   4. 收到 PUSH event（join / leave）时增删代理。
+##   5. 意外断线时在服务端宽限期内自动重连 + 重登（flows.md 流程 4 / 5）。
 ##
 ## 设计要点：
 ##   * 全部用代码 add_child 挂进场景，world.tscn 不需要（也不能轻易）改动；
 ##   * 断线 / 未登录时静默降级，单机玩完全不受影响；
+##   * 重连窗口取 5 秒（与服务端 GRACE_SECONDS 默认值对齐），窗口内登不回去就放弃；
 ##   * 远端代理是 player.tscn 的实例，preview_keys 关掉，免得按 1/2/3 也切它们的动画。
 
 const GameApi = preload("res://code/net/game_api.gd")
@@ -28,6 +30,11 @@ const MOTION_MOVING := "moving"
 const MOTION_IDLE := "idle"
 ## 三围初值（客户端目前还没有成长 / 伤害系统，先用满值上报）。
 const DEFAULT_STAT := 100.0
+## 断线重连的时间窗口（秒）。与服务端 config.GRACE_SECONDS 默认值一致：
+## 服务端视角的「意外断开」有这么久宽限期，窗口内登回来，会话与 player 行都还在。
+const RECONNECT_WINDOW := 5.0
+## 重连失败后的重试间隔（秒）。
+const RECONNECT_INTERVAL := 1.0
 
 ## 世界物品快照（首次拉取，以及 world_rev 变化时随 PUSH 下发）。
 signal world_items_received(items: Array)
@@ -52,6 +59,10 @@ var stamina := DEFAULT_STAT
 var mana := DEFAULT_STAT
 ## 世界元信息（拉 world 时缓下）。
 var world_meta: Dictionary = {}
+## 是否至少成功登录过一次（区分「启动时就连不上」与「玩到一半断了」）。
+var _logged_in_once := false
+## 是否正在重连（避免 connection_changed 与主循环互相踢出多次重连）。
+var _reconnecting := false
 
 
 func _ready() -> void:
@@ -61,6 +72,9 @@ func _ready() -> void:
 	_api.world_pushed.connect(_on_world)
 	_api.event_pushed.connect(_on_event)
 	_api.authenticated_changed.connect(_on_authenticated)
+	var tcp = _api.tcp()
+	if tcp != null:
+		tcp.connection_changed.connect(_on_connection_changed)
 	set_process(false)
 
 
@@ -73,14 +87,30 @@ func setup(player: Node3D, root_node: Node3D) -> void:
 
 func _bootstrap() -> void:
 	set_process(false)
-	var ok: bool = await _api.login_with_saved_account()
-	if not ok:
+	if not await _login_now():
 		push_warning("联机同步未登录：%s" % str(_api.last_error))
 		return
+	await _after_login()
+
+
+## 静默重登（建连 + hello + device + login）。成功返回 true。
+func _login_now() -> bool:
+	if not await _api.login_with_saved_account():
+		return false
+	_logged_in_once = true
+	return true
+
+
+## 登录成功后的共同收尾：打日志 + 拉世界快照 + 开主循环。
+## 首次进入与断线重连都走这里，避免两份逻辑走歪。
+func _after_login() -> void:
 	print("联机同步已就绪：%s @ 服务端 %s（协议 %s，推送 %.0fHz）" % [
 		_api.user_name, _api.server_version, _api.protocol_version, _api.push_hz,
 	])
-	# 首次进来把世界物品拉一次（后续只在 world_rev 变化时才随 PUSH 下发）。
+	if not is_inside_tree():
+		return
+	# 首次进来把世界物品拉一次（后续只在 world_rev 变化时才随 PUSH 下发）；
+	# 重连后也拉一次，补上断线期间错过的变更。
 	var res: Dictionary = await _api.fetch_world()
 	if bool(res.get("ok", false)):
 		var data: Dictionary = res.get("data", {})
@@ -88,7 +118,44 @@ func _bootstrap() -> void:
 		if not world_meta.is_empty():
 			world_meta_received.emit(world_meta)
 		world_items_received.emit(data.get("items", []))
-	set_process(true)
+	if is_inside_tree():
+		set_process(true)
+
+
+# ---------------------------------------------------------------- 断线重连
+
+## TCP 连接状态变化。断开时启动一次重连（服务端视角见 flows.md 流程 4 / 5）。
+func _on_connection_changed(connected: bool) -> void:
+	if connected:
+		return
+	_clear_avatars()
+	set_process(false)
+	if not is_inside_tree() or _player == null or not _logged_in_once or _reconnecting:
+		return
+	_try_reconnect()
+
+
+## 在 RECONNECT_WINDOW 秒内重试「重连 + 重登」。
+## 服务端对意外断开的会话有宽限期，窗口内登回来会把挂起的会话还给我们
+## （游戏内状态不丢）；超过窗口就静默降级单机，不影响玩家继续玩。
+func _try_reconnect() -> void:
+	_reconnecting = true
+	var deadline := Time.get_ticks_msec() + int(RECONNECT_WINDOW * 1000.0)
+	var attempt := 0
+	while is_inside_tree() and Time.get_ticks_msec() < deadline:
+		attempt += 1
+		if await _login_now():
+			_reconnecting = false
+			if is_inside_tree():
+				print("断线重连成功（第 %d 次尝试）" % attempt)
+				await _after_login()
+			return
+		if not is_inside_tree():
+			break
+		await get_tree().create_timer(RECONNECT_INTERVAL).timeout
+	_reconnecting = false
+	if is_inside_tree():
+		push_warning("断线重连失败，已降级为单机：%s" % str(_api.last_error))
 
 
 # ---------------------------------------------------------------- 主循环

@@ -1,11 +1,12 @@
 extends Node
 ## 业务层：把协议动作包成 GDScript 方法，并维护「本机设备 / 当前账号」状态。
 ##
-## 与旧版的区别：
-##   * 旧版是「一次请求一次 HTTP」，用完即弃；这里是**一条TCP长连接**，
-##     登录后同一连接会持续收到 PUSH world。
-##   * 设备标识改由**服务端签发**（客户端不持密钥），拿到后原样存在本地。
-##   * user_id 改由**服务端生成**，注册只提交 user_name。
+## 协议 v1.2（规范见 server-socket/protocol.md 与 flows.md）：
+##   * 一条 TCP 长连接，登录后同一条连接会持续收到 PUSH world；
+##   * 设备标识由**服务端签发**（客户端不持密钥），拿到后原样存在本地；
+##   * user_id 由**服务端生成**，注册提交 `<user_name>&<race>&<player_id>`；
+##   * player_id 是**本机生成的 UUID**（协议 v1.2），服务端另存一份做本地标识；
+##   * 会话 Token 由 TcpClient 自动维护，本层只管 token 失效后的重登。
 
 const TcpClient = preload("res://code/net/tcp_client.gd")
 const NetConfig = preload("res://code/net/net_config.gd")
@@ -27,11 +28,17 @@ var user_id := ""
 var user_name := ""
 var authenticated := false
 
-## 服务端返回的玩家身份（register / login 响应里的新字段）。
-## `player_id` 目前与 user_id 同值；`player_name` 是游戏内显示名；`race` 是种族 key。
+## 玩家身份（register / login 响应里回显）。
+## `player_id` 是**本机生成的 UUID**（协议 v1.2），服务端拿它做本地标识；
+## `player_name` 是游戏内显示名；`race` 是种族 key。
 var player_id := ""
 var player_name := ""
 var race := ""
+
+## 登录校验文件哈希（协议 v1.2 可选字段）。**默认空 = 不参与校验**：
+## 服务端会把首次提交的值钉在库里，之后不一致就拒登（FILE_HASH_MISMATCH），
+## 客户端一升级就会把自己锁在外面，所以默认不开。
+var file_hash := ""
 
 ## 最近一次 `state` 响应回写的行修订号（服务端的 player.rev）。
 var state_rev := 0
@@ -129,18 +136,34 @@ func ensure_device() -> bool:
 
 # ---------------------------------------------------------------- 账号
 
-## 注册。payload 为 `<user_name>[&<race>]`；`race` 缺省时用本机保存的种族。
+## 本机 player_id（UUID）：注册时要交给服务端，没有就当场生成并落盘。
+func ensure_player_id() -> String:
+	var pid := AccountStore.ensure_player_id()
+	if pid == "":
+		push_warning("无法生成 / 保存本机 player_id，注册将退化为由服务端回填 user_id")
+	return pid
+
+
+## 名称查重（v1.2 新增动作，注册前调）。
+## 返回统一响应结构；可用性看 `data.available`，原因看 `data.reason`（taken / invalid）。
+## 老服务端没有这个动作时会回 UNKNOWN_ACTION —— 调用方应当当作「查不了，直接进注册」。
+func check_name(candidate: String) -> Dictionary:
+	return await _call("check_name", candidate.strip_edges(), device_hex)
+
+
+## 注册。payload 为 `<user_name>&<race>&<player_id>`（第三段是本机 UUID，v1.2）。
+## `race` 缺省时用本机保存的种族。
 func register(new_user_name: String, new_race := "") -> Dictionary:
 	var chosen := new_race.strip_edges()
 	if chosen == "":
 		chosen = AccountStore.read_race()
-	var payload := new_user_name
-	if chosen != "":
-		payload += "&" + chosen
+	var pid := ensure_player_id()
+	var payload := "%s&%s&%s" % [new_user_name, chosen, pid]
 	var res: Dictionary = await _call("register", payload, device_hex)
 	if bool(res.get("ok", false)):
 		var data: Dictionary = res.get("data", {})
 		_remember_player(data)
+		_adopt_session_token(data)
 		_mark_authenticated(str(data.get("user_id", "")), str(data.get("user_name", new_user_name)))
 		if race != "":
 			AccountStore.write_race(race)
@@ -148,12 +171,36 @@ func register(new_user_name: String, new_race := "") -> Dictionary:
 
 
 func login(login_user_id: String) -> Dictionary:
-	var res: Dictionary = await _call("login", login_user_id, device_hex)
+	var res: Dictionary = await _login_no_retry(login_user_id, device_hex)
+	if bool(res.get("ok", false)):
+		var data: Dictionary = res.get("data", {})
+		_mark_authenticated(str(data.get("user_id", login_user_id)), str(data.get("user_name", "")))
+	return res
+
+
+## 真正发 `login` 的那一层（不重试）。
+## v1.2 的 payload 是 JSON：`{"player_id", "file_hash"}`；
+## 协议里的 `player_id` 在登录语境下就是服务端的 `user_id`（见 flows.md §8）。
+## `file_hash` 为空时不写这个键 —— 服务端按「不参与校验」处理。
+func _login_no_retry(login_user_id: String, device: String) -> Dictionary:
+	var payload := {"player_id": login_user_id.strip_edges().to_upper()}
+	if file_hash != "":
+		payload["file_hash"] = file_hash
+	var res: Dictionary = await _tcp.request("login", JSON.stringify(payload), device, "")
 	if bool(res.get("ok", false)):
 		var data: Dictionary = res.get("data", {})
 		_remember_player(data)
-		_mark_authenticated(str(data.get("user_id", login_user_id)), str(data.get("user_name", "")))
+		_adopt_session_token(data)
 	return res
+
+
+## 响应里回显的 `session_token` 存一份（reset 后靠它取回可用值）。
+func _adopt_session_token(data: Dictionary) -> void:
+	if _tcp == null:
+		return
+	var token := str(data.get("session_token", "")).strip_edges()
+	if token != "":
+		_tcp.adopt_token(token)
 
 
 func logout() -> Dictionary:
@@ -163,6 +210,10 @@ func logout() -> Dictionary:
 		user_name = ""
 		player_id = ""
 		player_name = ""
+		# 服务端 logout 会把本连接的 token 作废；本地必须同步清掉，
+		# 否则下一条请求带着旧 token 会被回 SESSION_TOKEN_EXPIRED。
+		if _tcp != null:
+			_tcp.clear_token()
 		set_authenticated(false)
 	return res
 
@@ -277,13 +328,38 @@ func world_name() -> String:
 	return str(world_meta.get("name", ""))
 
 
+## 本连接的会话 Token（协议 v1.2，空串 = 未拿到 / 已作废）。
+func session_token() -> String:
+	return "" if _tcp == null else str(_tcp.session_token)
+
+
 # ---------------------------------------------------------------- 内部
 
 ## 登录前带上设备（服务端要靠它认人），登录后就不再重复传 2KB 的 hex。
+## v1.2：token 由 TcpClient 自动带上；token 失效时这里会自动重登并重试一次。
 func _call(action: String, action_data := "", override_device := "") -> Dictionary:
 	var device := ""
 	if not authenticated:
 		device = override_device if override_device != "" else device_hex
+	var res: Dictionary = await _tcp.request(action, action_data, device, "")
+	if str(res.get("code", "")) != "SESSION_TOKEN_EXPIRED":
+		return res
+	return await _retry_after_token_reset(action, action_data)
+
+
+## 拿到 SESSION_TOKEN_EXPIRED：清 token → 重登换新 token → 重试原请求（只重试一次）。
+## 服务端的 token 校验在 dispatch 之前，所以被拒的请求没有副作用，重试是安全的。
+func _retry_after_token_reset(action: String, action_data: String) -> Dictionary:
+	push_warning("会话 Token 已失效，重新登录后重试：%s" % action)
+	if _tcp != null:
+		_tcp.clear_token()
+	var device := device_hex
+	if user_id != "" and device != "":
+		var relog: Dictionary = await _login_no_retry(user_id, device)
+		if not bool(relog.get("ok", false)):
+			last_error = _explain(relog, "会话已失效，请重新登录")
+			return relog
+		device = ""
 	return await _tcp.request(action, action_data, device, "")
 
 
@@ -295,8 +371,23 @@ func _on_pushed(topic: String, payload: Dictionary) -> void:
 			if str(payload.get("kind", "")) == "leave" and str(payload.get("user_id", "")) == user_id:
 				set_authenticated(false)
 			event_pushed.emit(payload)
+		"reset_token":
+			# 服务端认定本地拿的是旧 Token（flows.md 流程 5）：重登一次换回来
+			_relogin_after_token_reset.call_deferred()
 		_:
 			pass
+
+
+## token 被服务端作废后重登（拿回新 token + 重新绑定会话）。
+func _relogin_after_token_reset() -> void:
+	if user_id == "" or device_hex == "":
+		return
+	var res: Dictionary = await _login_no_retry(user_id, device_hex)
+	if bool(res.get("ok", false)):
+		print("会话 Token 已重置，重新登录成功")
+	else:
+		push_warning("会话 Token 重置后重新登录失败：%s" % str(res.get("code", "")))
+		set_authenticated(false)
 
 
 ## 供 UI 层调用：把服务端错误码转成一句人话。
@@ -336,6 +427,14 @@ func _explain(res: Dictionary, fallback: String) -> String:
 			return "账号已被锁定，暂时无法登录"
 		"ACCOUNT_DISABLED":
 			return "账号已停用"
+		"FILE_HASH_MISMATCH":
+			return "客户端文件校验失败，请重新安装客户端"
+		"SESSION_TOKEN_EXPIRED", "BAD_SESSION_TOKEN":
+			return "会话已失效，正在重新连接"
+		"DUPLICATE_REQUEST":
+			return "操作过于频繁，请稍后重试"
+		"BAD_PAYLOAD":
+			return "请求格式不正确，请更新客户端"
 		"INTERNAL_ERROR":
 			return "服务器内部错误，请稍后重试"
 		"SHUTTING_DOWN":
