@@ -9,8 +9,9 @@
 
 1. 用 ``DB_BACKEND=memory`` 拉起一整套 Service（TCP 监听 127.0.0.1:0 随机端口）；
 2. 用原始 socket + `protocol.build_request/parse_response` 说完整链路；
-3. 覆盖：握手 / 设备签发与确认 / 注册 / 登录 / 重放 / 哈希篡改 / 时间戳过期 /
-   未知动作 / 设备伪造 / 10Hz PUSH / 双客户端同屏 / 下线事件。
+3. 覆盖：会话 Token 下发与校验 / 握手 / 设备签发与确认 / 名称查重 / 注册 / 登录
+   （含 file_hash）/ 重放 / 哈希篡改 / 时间戳过期 / 未知动作 / 设备伪造 /
+   10Hz PUSH / 双客户端同屏 / 正常下线完整拆除 / 意外断开宽限期与超时销毁。
 
 退出码 0 = 全绿。
 """
@@ -40,6 +41,7 @@ except (AttributeError, ValueError):
 os.environ["DB_BACKEND"] = "memory"
 
 import config  # noqa: E402
+import game  # noqa: E402
 import protocol  # noqa: E402
 
 USER_ID_RE = re.compile(r"^[A-Z0-9]{4}-[A-Z0-9]{4}$")
@@ -90,15 +92,40 @@ class Runner:
 # TCP 客户端
 # ---------------------------------------------------------------------------
 class Client:
-    """极简客户端：一次请求 / 一条响应，PUSH 帧单独收集。"""
+    """极简客户端：一次请求 / 一条响应，PUSH 帧单独收集。
 
-    def __init__(self, host: str, port: int) -> None:
+    v1.2：建连后服务端会主动推一帧 ``PUSH | token``，构造时默认先取到它，
+    后续请求自动携带（想测旧行为可用 ``await_token=False``）。
+    """
+
+    def __init__(self, host: str, port: int, await_token: bool = True) -> None:
         self.sock = socket.create_connection((host, port), timeout=5.0)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._buf = b""
         self.pushes: list[protocol.Response] = []
         self.device_id = ""
         self.user_id = ""
+        self.token = ""
+        self.token_expire = 0
+        if await_token:
+            self.await_token()
+
+    # -- Token -------------------------------------------------------
+    def await_token(self, timeout: float = 5.0) -> protocol.Response | None:
+        """读服务端建连时主动推的 ``PUSH | token`` 帧。"""
+        deadline = time.time() + timeout
+        while True:
+            line = self.read_line(max(0.05, deadline - time.time()))
+            if line is None:
+                return None
+            resp = protocol.parse_response(line)
+            if resp.kind == "PUSH" and resp.topic == protocol.TOPIC_TOKEN:
+                self.token = str(resp.data.get("token") or "")
+                self.token_expire = int(resp.data.get("expire") or 0)
+                self.pushes.append(resp)      # 留给用例回看「确实推过这一帧」
+                return resp
+            if resp.kind == "PUSH":
+                self.pushes.append(resp)
 
     # -- 低层 ---------------------------------------------------------
     def send_raw(self, data: bytes) -> None:
@@ -145,14 +172,16 @@ class Client:
         device: str | None = None,
         user: str | None = None,
         raw_device_id: str | None = None,
+        session_token: str | None = None,
         **kw,
     ) -> protocol.Response | None:
-        """发一条请求并等响应。device/user 默认沿用本会话已记住的值。"""
+        """发一条请求并等响应。device/user/token 默认沿用本会话已记住的值。"""
         dev = self.device_id if device is None else device
         usr = self.user_id if user is None else user
+        tok = self.token if session_token is None else session_token
         if raw_device_id is not None:
             dev = raw_device_id
-        packet = protocol.build_request(action, data, dev, usr, **kw)
+        packet = protocol.build_request(action, data, dev, usr, session_token=tok, **kw)
         self.send_raw(packet)
         resp = self.read_frame()
         return resp
@@ -169,6 +198,13 @@ class Client:
             if resp.kind == "PUSH":
                 self.pushes.append(resp)
         return self.pushes
+
+    def find_push(self, topic: str) -> protocol.Response | None:
+        """在已收到的 PUSH 里找指定 topic 的最后一帧。"""
+        for resp in reversed(self.pushes):
+            if resp.topic == topic:
+                return resp
+        return None
 
     def close(self) -> None:
         try:
@@ -199,6 +235,7 @@ def run(verbose: bool = False) -> int:
         tcp_port=0,
         autosave_interval=3600,
         push_hz=10,
+        grace_seconds=2,      # 宽限期缩到 2s，超时销毁的用例才能跑得快
         device_id_secret="",  # 内存后端允许临时密钥
     )
     service = main_mod.Service(cfg)
@@ -211,8 +248,25 @@ def run(verbose: bool = False) -> int:
 
     a = Client(host, port)
     b = Client(host, port)
+    extra: list[Client] = []      # 中途新开的连接，统一在 finally 里关
     try:
         # ------------------------------------------------------------------
+        t.case("v1.2 建连即推送会话 Token")
+        t.check(len(a.token) == 32, f"token 应为 32 位 hex，实得 {a.token!r}")
+        t.eq(a.token_expire, 180, "token 有效期（秒）")
+        t.check(a.token != b.token, "两条连接的 token 应不同")
+        first_push = a.find_push(protocol.TOPIC_TOKEN)
+        t.check(first_push is not None, "应收到 PUSH | token 帧")
+
+        t.case("带错 token 的请求被拒 + 回推 reset_token")
+        a.pushes.clear()
+        r = a.call("ping", session_token="deadbeef" + a.token[8:])
+        t.check(r is not None and r.kind == "FAIL", "应返回 FAIL")
+        if r is not None:
+            t.eq(r.code, protocol.E_TOKEN_EXPIRED, "错误码")
+        t.check(a.find_push(protocol.TOPIC_RESET_TOKEN) is not None,
+                "应同时收到 PUSH | reset_token")
+
         t.case("hello 握手")
         r = a.call("hello")
         t.check(r is not None, "没有响应")
@@ -220,7 +274,8 @@ def run(verbose: bool = False) -> int:
             t.eq(r.kind, "OK", "frame kind")
             t.eq(r.data.get("protocol_version"), protocol.CURRENT_VERSION, "协议版本")
             actions = r.data.get("actions") or []
-            for wanted in ("device", "register", "login", "state", "peers", "world", "item"):
+            for wanted in ("device", "check_name", "register", "login", "logout",
+                           "state", "peers", "world", "item"):
                 t.check(wanted in actions, f"动作表包含 {wanted}")
 
         t.case("协议级错误：坏 magic")
@@ -285,14 +340,39 @@ def run(verbose: bool = False) -> int:
             t.eq(r.code, protocol.E_NOT_AUTHENTICATED, "错误码")
 
         # ------------------------------------------------------------------
-        t.case("register 注册")
-        r = a.call("register", "勇者")
+        t.case("check_name 重名检测")
+        r = a.call("check_name", "勇者")
+        t.check(r is not None and r.ok, "应 OK")
+        if r is not None and r.ok:
+            t.eq(r.data.get("available"), True, "还未注册，应用")
+
+        t.case("register 注册（带客户端 player_id UUID）")
+        r = a.call("register", "勇者&human&11111111-2222-3333-4444-555555555555")
         t.check(r is not None and r.ok, "应 OK")
         if r is not None and r.ok:
             t.eq(r.data.get("user_name"), "勇者", "用户名")
+            t.eq(r.data.get("player_id"), "11111111-2222-3333-4444-555555555555",
+                 "回显客户端生成的 player_id")
             uid = r.data.get("user_id", "")
             t.check(bool(USER_ID_RE.match(uid)), f"user_id 格式 {uid!r}")
             a.user_id = uid
+
+        t.case("check_name 注册后变重名")
+        r = a.call("check_name", "勇者")
+        t.check(r is not None and r.ok, "应 OK")
+        if r is not None and r.ok:
+            t.eq(r.data.get("available"), False, "已注册应不可用")
+            t.eq(r.data.get("reason"), "taken", "不可用原因")
+        r = a.call("check_name", "bad&name")
+        t.check(r is not None and r.ok, "应 OK")
+        if r is not None and r.ok:
+            t.eq(r.data.get("reason"), "invalid", "非法字符算 invalid")
+
+        t.case("register 时设备才入库")
+        r = a.call("device")
+        t.check(r is not None and r.ok, "device 应 OK")
+        if r is not None and r.ok:
+            t.eq((r.data or {}).get("stored"), True, "register 后设备已在库里")
 
         t.case("重放同一报文被去重")
         packet = protocol.build_request("register", "另一个名字", a.device_id, "")
@@ -378,36 +458,94 @@ def run(verbose: bool = False) -> int:
             t.eq(r.code, protocol.E_BAD_USER_ID, "错误码")
 
         # ------------------------------------------------------------------
-        t.case("logout 后回到未认证")
-        r = a.call("logout")
+        t.case("logout 完整拆除（流程 3）")
+        b_user = b.user_id
+        r = b.call("logout")
         t.check(r is not None and r.ok, "logout 应 OK")
-        r = a.call("state", "0&0&0&0")
-        t.check(r is not None and r.kind == "FAIL", "state 应被拒")
         if r is not None:
-            t.eq(r.code, protocol.E_NOT_AUTHENTICATED, "错误码")
-
-        t.case("login 重新登录")
-        r = a.call("login", a.user_id)
-        t.check(r is not None and r.ok, "login 应 OK")
-        if r is not None and r.ok:
-            t.eq(r.data.get("user_id"), a.user_id, "user_id")
-        r = a.call("whoami")
-        t.check(r is not None and r.ok and (r.data or {}).get("authenticated") is True, "应已认证")
-
+            t.eq(r.data.get("saved"), True, "已落库")
+            t.eq(r.data.get("authenticated"), False, "已解除认证")
+        t.check(game.get_player(b_user) is None, "player 热缓存已销毁")
+        b.pushes.clear()
+        r = b.call("state", "0&0&0&0")          # 拿已作废的 token 再来
+        t.check(r is not None and r.kind == "FAIL", "旧 token 应被拒")
+        if r is not None:
+            t.eq(r.code, protocol.E_TOKEN_EXPIRED, "错误码")
+        t.check(b.find_push(protocol.TOPIC_RESET_TOKEN) is not None,
+                "应同时收到 reset_token 推送")
         t.case("device 确认后能拿回账号（免登录入口）")
         r = a.call("device")
         account = (r.data or {}).get("account") if r is not None else None
-        t.check(isinstance(account, dict), f"account 应为对象 got={account!r}")
+        t.check(isinstance(account, dict), f"account 应为对象 got={account!r} resp={r!r}")
         if isinstance(account, dict):
             t.eq(account.get("user_id"), a.user_id, "account.user_id")
             t.eq(account.get("user_name"), "勇者", "account.user_name")
 
-        t.case("断线：玩家转离线")
-        b.close()
+        t.case("下线后重连：login 带 file_hash，player 从库重载")
+        b2 = Client(host, port)
+        extra.append(b2)
+        b2.device_id = b.device_id
+        r = b2.call(
+            "login", '{"player_id":"%s","file_hash":"hash-1"}' % b_user, user=""
+        )
+        t.check(r is not None and r.ok, f"login 应 OK got={r}")
+        if r is not None and r.ok:
+            t.eq(r.data.get("user_id"), b_user, "user_id")
+            t.eq(r.data.get("session_token"), b2.token, "响应回显会话 token")
+        r = b2.call("peers")
+        ids = {p.get("user_id") for p in ((r.data or {}).get("players") or [])} if r else set()
+        t.check(b_user in ids, f"重载后应重新在线 ids={ids}")
+
+        t.case("file_hash 不一致时拒登（流程 2 完整性校验）")
+        b3 = Client(host, port)
+        extra.append(b3)
+        b3.device_id = b.device_id
+        r = b3.call(
+            "login", '{"player_id":"%s","file_hash":"hash-2"}' % b_user, user=""
+        )
+        t.check(r is not None and r.kind == "FAIL", "哈希不一致应失败")
+        if r is not None:
+            t.eq(r.code, protocol.E_FILE_HASH_MISMATCH, "错误码")
+        b3.close()
+
+        # ------------------------------------------------------------------
+        t.case("意外断开：宽限期内仍在线")
+        r = b2.call("state", "77&0&0&0")
+        t.check(r is not None and r.ok, "上报位置应 OK")
+        b2.sock.close()                       # 硬断，不发 logout
         time.sleep(0.4)
+        t.check(game.get_player(b_user) is not None, "宽限期内热缓存仍在")
+        row = game.get_player(b_user) or {}
+        t.eq(row.get("online"), True, "宽限期内仍算在线")
         r = a.call("peers")
         ids = {p.get("user_id") for p in ((r.data or {}).get("players") or [])} if r else set()
-        t.check(b.user_id not in ids, f"B 应已离线 ids={ids}")
+        t.check(b_user in ids, f"其他玩家此时仍能看到他 ids={ids}")
+
+        t.case("宽限期内重连：同设备接管，位置不丢")
+        b4 = Client(host, port)
+        extra.append(b4)
+        b4.device_id = b.device_id
+        r = b4.call(
+            "login", '{"player_id":"%s","file_hash":"hash-1"}' % b_user, user=""
+        )
+        t.check(r is not None and r.ok, f"重连登录应 OK got={r}")
+        row = game.get_player(b_user) or {}
+        t.eq(row.get("pos_x"), 77.0, "宽限期内重连保留实时位置")
+        t.eq(len(service.hub._suspended), 0, "挂起会话已被接管")
+
+        t.case("宽限期超时：落库 + 销毁 + 广播 leave")
+        b4.sock.close()
+        pushes = a.drain_pushes(cfg.grace_seconds + 1.5)
+        leaves = [
+            p for p in pushes
+            if p.topic == protocol.TOPIC_EVENT and (p.data or {}).get("kind") == "leave"
+            and (p.data or {}).get("user_id") == b_user
+        ]
+        t.check(bool(leaves), "应收到该玩家的 leave 广播")
+        t.check(game.get_player(b_user) is None, "宽限期超时后 player 已销毁")
+        r = a.call("peers")
+        ids = {p.get("user_id") for p in ((r.data or {}).get("players") or [])} if r else set()
+        t.check(b_user not in ids, f"超时后应离线 ids={ids}")
         t.check(a.user_id in ids, "A 仍在线")
 
         t.case("运行统计")
@@ -420,8 +558,8 @@ def run(verbose: bool = False) -> int:
         t.failed.append(("<exception>", traceback.format_exc()))
         print(traceback.format_exc())
     finally:
-        a.close()
-        b.close()
+        for client in [a, b, *extra]:
+            client.close()
         service.close()
 
     return t.summary()

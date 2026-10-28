@@ -273,10 +273,14 @@ def _new_player_row(
     device_id_hex: str = "",
     race: str = "",
     player_name: str = "",
+    player_id: str = "",
+    file_hash: str = "",
 ) -> dict:
     row = {
         "user_id": user_id,
         "user_name": user_name or "",
+        "player_id": player_id or "",        # 客户端生成的 UUID
+        "file_hash": file_hash or "",       # 登录校验文件哈希
         "player_name": player_name or user_name or "",
         "race": race or DEFAULT_RACE,
         "device_id": device_id_hex or "",
@@ -286,7 +290,9 @@ def _new_player_row(
         "yaw": 0.0,
         "state": "idle",
         "online": True,
-        "rev": 0,
+        # 从当前全局修订号起算：下线后销毁了缓存行、重连重建时，
+        # rev 从 0 起会被库里上一轮的旧 rev 拒掉（反而丢数据）。
+        "rev": _players_rev,
         "updated_at": time.time(),
     }
     row.update(DEFAULT_STATS)
@@ -345,36 +351,96 @@ def remove_player(user_id: str) -> bool:
     return existed
 
 
+def _normalize_player_row(row: dict) -> dict | None:
+    """把库里读回的 player 行归一成内存形状。
+
+    启动预载与「销毁后重连重载」共用这一份规则，两边行为必须一致：
+    ``online`` 一律 False（拿到这条数据的人还没上线，由 enter_world 置 True），
+    ``rev`` 原样继承（否则写库会被 rev 门禁拒掉）。
+    """
+    user_id = str(row.get("user_id") or "").strip()
+    if not user_id:
+        return None
+    return {
+        "user_id": user_id,
+        "user_name": str(row.get("user_name") or ""),
+        "player_id": str(row.get("player_id") or ""),
+        "file_hash": str(row.get("file_hash") or ""),
+        "player_name": str(row.get("player_name") or row.get("user_name") or ""),
+        "race": str(row.get("race") or DEFAULT_RACE),
+        "device_id": "",          # 设备不在 player 表里
+        "pos_x": _num(row.get("pos_x")),
+        "pos_y": _num(row.get("pos_y")),
+        "pos_z": _num(row.get("pos_z")),
+        "yaw": _norm_yaw(row.get("yaw")),
+        "state": str(row.get("state") or "idle"),
+        "online": False,           # 重启后/重载时没人在线
+        "hp_max": _num(row.get("hp_max"), 100.0),
+        "hp": _num(row.get("hp"), 100.0),
+        "stamina_max": _num(row.get("stamina_max"), 100.0),
+        "stamina": _num(row.get("stamina"), 100.0),
+        "mana_max": _num(row.get("mana_max"), 100.0),
+        "mana": _num(row.get("mana"), 100.0),
+        "rev": int(row.get("rev") or 0),
+        "updated_at": _num(row.get("updated_at"), time.time()),
+    }
+
+
 def enter_world(
     user_id: str,
     user_name: str = "",
     device_id_hex: str = "",
     race: str = "",
     player_name: str = "",
+    player_id: str = "",
+    file_hash: str = "",
+    store=None,
 ) -> dict | None:
     """玩家进入世界（注册/登录成功后调）。
 
-    缓存里没有该玩家就用库里的数据（由 ``load_from_store`` 预载）建行；
-    有则保留坐标与三围，只把 ``online`` 置回 True。
-    这样重启后玩家还会出现在上次站的地方。
+    缓存里没有该玩家时，先从库读一次（下线时被 ``destroy_player`` 销毁过），
+    读到就原位重进，读不到才新建行 —— 这就是 flows.md 流程 4 里的「player 重载」。
+    坐标与三围都从库里那条最新记录恢复，不会回到出生点。
+
+    ``player_id`` / ``file_hash`` 只在当前为空时填，不能把库里已有的值刷掉。
     """
     if not user_id:
         return None
+
+    # DB 读取必须在锁外：否则一个慢查询会卡住 10Hz 推送线程
+    backend = store or _store
+    stored_row: dict | None = None
+    if get_player(user_id) is None and backend is not None:
+        try:
+            stored_row = backend.load_player(user_id)
+        except Exception as exc:  # noqa: BLE001 - 读不到就当作新玩家
+            log.warning("重载玩家 %s 失败：%s", user_id, exc)
+            stored_row = None
+
     with mutate():
         row = players.get(user_id)
         if row is None:
-            row = _new_player_row(user_id, user_name, device_id_hex, race, player_name)
+            if stored_row is not None:
+                row = _normalize_player_row(stored_row) or _new_player_row(user_id)
+            else:
+                row = _new_player_row(
+                    user_id, user_name, device_id_hex, race, player_name,
+                    player_id, file_hash,
+                )
             players[user_id] = row
-        else:
-            if user_name:
-                row["user_name"] = user_name
-            if player_name:
-                row["player_name"] = player_name
-            if race:
-                row["race"] = race
-            if device_id_hex:
-                row["device_id"] = device_id_hex
-            row["online"] = True
+        if user_name:
+            row["user_name"] = user_name
+        if player_name:
+            row["player_name"] = player_name or row.get("player_name", "")
+        if race:
+            row["race"] = race
+        if device_id_hex:
+            row["device_id"] = device_id_hex
+        if player_id and not row.get("player_id"):
+            row["player_id"] = player_id
+        if file_hash and not row.get("file_hash"):
+            row["file_hash"] = file_hash
+        row["online"] = True
         row["rev"] = int(row.get("rev", 0)) + 1
         row["updated_at"] = time.time()
         result = dict(row)
@@ -383,6 +449,11 @@ def enter_world(
 
 
 def mark_offline(user_id: str) -> None:
+    """标为离线：**只改 online，不删 key**（彻底移除见 ``destroy_player``）。
+
+    保留缓存行是有意的：宽限期内重连、或同账号另一条连接上线时，
+    坐标与三围不应该丢。
+    """
     with mutate():
         row = players.get(user_id)
         if row is None:
@@ -392,6 +463,22 @@ def mark_offline(user_id: str) -> None:
         row["rev"] = int(row.get("rev", 0)) + 1
         row["updated_at"] = time.time()
     bump_players_rev()
+
+
+def destroy_player(user_id: str) -> bool:
+    """销毁一名玩家的热缓存行（正常下线 / 宽限期超时都走这里）。
+
+    与 ``mark_offline`` 的区别：这里是**彻底移除**，同时清掉
+    “已落库 rev” 记录，下次该玩家重连时从库中重新加载。
+    调用前必须已经把数据 flush 进库（``save_player``）。
+    """
+    global _players_rev
+    with _lock:
+        existed = players.pop(user_id, None) is not None
+        _persisted_player_revs.pop(str(user_id), None)
+        if existed:
+            _players_rev += 1
+    return existed
 
 
 def players_payload(include_offline: bool = False) -> list[dict]:
@@ -507,6 +594,45 @@ def save(store=None) -> bool:
     return True
 
 
+def save_player(user_id: str, store=None) -> bool:
+    """单独 flush 一名玩家（不走定时落库）。
+
+    下线 / 宽限期超时时用：先把最后一帧写进库，再销毁内存行。
+    落后于库的行会被 rev 门禁拒掉，但仍返回 True（不报错，以库为准）。
+    """
+    backend = store or _store
+    if backend is None:
+        log.warning("单行落库跳过：存储层未初始化")
+        return False
+    if not user_id:
+        return False
+
+    with _lock:
+        row = players.get(user_id)
+        payload = dict(row) if row else None
+
+    if payload is None:
+        return True      # 已经没有这一行（重复下线），没东西可写
+
+    try:
+        result = backend.save_players([payload])
+    except Exception as exc:  # noqa: BLE001 - 落库失败也要留证据
+        log.error("玩家 %s 落库失败，写本地快照：%s", user_id, exc)
+        _dump_snapshot()
+        return False
+
+    stale = [str(x) for x in (result.get("stale") or [])]
+    written = int(result.get("written") or 0)
+    if user_id not in stale:
+        with _lock:
+            _persisted_player_revs[str(user_id)] = int(payload.get("rev", 0) or 0)
+    if stale:
+        log.warning("玩家 %s 的数据落后于库，本次落库被拒（以库为准）", user_id)
+    elif written:
+        log.info("玩家 %s 已落库（rev=%d）", user_id, int(payload.get("rev", 0) or 0))
+    return True
+
+
 def _snapshot_lists_unlocked() -> tuple[list[dict], list[dict]]:
     """同 ``_snapshot_lists()``，但调用方已持锁。"""
     return ([dict(it) for it in world.values()],
@@ -597,31 +723,9 @@ def load_from_store(store) -> bool:
             }
 
         for row in player_rows:
-            user_id = str(row.get("user_id") or "").strip()
-            if not user_id:
-                continue
-            new_row = {
-                "user_id": user_id,
-                "user_name": str(row.get("user_name") or ""),
-                "player_name": str(row.get("player_name") or row.get("user_name") or ""),
-                "race": str(row.get("race") or DEFAULT_RACE),
-                "device_id": "",          # 设备不在 player 表里
-                "pos_x": _num(row.get("pos_x")),
-                "pos_y": _num(row.get("pos_y")),
-                "pos_z": _num(row.get("pos_z")),
-                "yaw": _norm_yaw(row.get("yaw")),
-                "state": str(row.get("state") or "idle"),
-                "online": False,           # 重启后没人在线
-                "hp_max": _num(row.get("hp_max"), 100.0),
-                "hp": _num(row.get("hp"), 100.0),
-                "stamina_max": _num(row.get("stamina_max"), 100.0),
-                "stamina": _num(row.get("stamina"), 100.0),
-                "mana_max": _num(row.get("mana_max"), 100.0),
-                "mana": _num(row.get("mana"), 100.0),
-                "rev": int(row.get("rev") or 0),
-                "updated_at": _num(row.get("updated_at"), time.time()),
-            }
-            players[user_id] = new_row
+            new_row = _normalize_player_row(row)
+            if new_row is not None:
+                players[new_row["user_id"]] = new_row
 
         _world_rev = max(
             [int(it.get("rev") or 0) for it in world.values()]

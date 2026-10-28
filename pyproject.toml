@@ -1,6 +1,6 @@
 [project]
 name = "the-door-of-bings-server-socket"
-version = "2.0.0"
+version = "3.0.0"
 description = "众生之门（The Door of All Beings）TCP 游戏协议服务：长连接 + 10Hz 推送 + 账号/世界数据"
 readme = "README.md"
 requires-python = ">=3.12"

@@ -45,7 +45,7 @@ DEFAULT_WORLD = "default"
 
 ## player 表参与落库的字段（顺序与 INSERT 语句一致）
 PLAYER_COLUMNS = (
-    "user_id", "player_name", "race",
+    "user_id", "player_id", "file_hash", "player_name", "race",
     "pos_x", "pos_y", "pos_z", "yaw", "state", "online",
     "hp_max", "hp", "stamina_max", "stamina", "mana_max", "mana",
     "rev",
@@ -118,6 +118,8 @@ def player_params(row: dict) -> tuple:
     """把内存里的 player 行整理成 INSERT 参数（顺序 = PLAYER_COLUMNS）。"""
     return (
         _text(row.get("user_id")),
+        _text(row.get("player_id")),
+        _text(row.get("file_hash")),
         _text(row.get("player_name")),
         _text(row.get("race"), "human") or "human",
         _num(row.get("pos_x")),
@@ -192,12 +194,28 @@ class Store:
         """登录用：按 user_id 取整行（含 device_id / status / locked_until）。"""
         raise NotImplementedError
 
+    def name_exists(self, user_name: str) -> bool:
+        """账号名是否已被占用（注册前的重名检测用）。"""
+        raise NotImplementedError
+
+    def player_file_hash(self, user_id: str) -> str:
+        """取 player 行里记录的登录校验文件哈希；无行 / 未初始化返回空串。"""
+        raise NotImplementedError
+
+    def set_player_file_hash(self, user_id: str, file_hash: str) -> None:
+        """首次登录时写入文件哈希（已有值不覆盖；无行则补行）。"""
+        raise NotImplementedError
+
     def touch_login(self, user_id: str, device_id_hex: str) -> None:
         raise NotImplementedError
 
     # --- player ---------------------------------------------------------
     def load_players(self) -> list[dict]:
         """读全量玩家行（附带 users.user_name）。"""
+        raise NotImplementedError
+
+    def load_player(self, user_id: str) -> dict | None:
+        """读单名玩家行（下线销毁后重连时重载用）。"""
         raise NotImplementedError
 
     def save_players(self, rows: Iterable[dict]) -> dict:
@@ -232,26 +250,29 @@ class Store:
 ## 只有库里 rev 更小才允许覆盖（= 只接受领先数据）
 _SAVE_PLAYER_SQL = """
     INSERT INTO player (
-        user_id, player_name, race, pos_x, pos_y, pos_z, yaw, state, online,
+        user_id, player_id, file_hash, player_name, race,
+        pos_x, pos_y, pos_z, yaw, state, online,
         hp_max, hp, stamina_max, stamina, mana_max, mana, rev, updated_at
-    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
     ON CONFLICT (user_id) DO UPDATE SET
-        player_name = EXCLUDED.player_name,
-        race        = EXCLUDED.race,
-        pos_x       = EXCLUDED.pos_x,
-        pos_y       = EXCLUDED.pos_y,
-        pos_z       = EXCLUDED.pos_z,
-        yaw         = EXCLUDED.yaw,
-        state       = EXCLUDED.state,
-        online      = EXCLUDED.online,
-        hp_max      = EXCLUDED.hp_max,
-        hp          = EXCLUDED.hp,
-        stamina_max = EXCLUDED.stamina_max,
-        stamina     = EXCLUDED.stamina,
-        mana_max    = EXCLUDED.mana_max,
-        mana        = EXCLUDED.mana,
-        rev         = EXCLUDED.rev,
-        updated_at  = now()
+        player_id     = COALESCE(NULLIF(EXCLUDED.player_id, ''), player.player_id),
+        file_hash     = COALESCE(NULLIF(EXCLUDED.file_hash, ''), player.file_hash),
+        player_name   = EXCLUDED.player_name,
+        race          = EXCLUDED.race,
+        pos_x         = EXCLUDED.pos_x,
+        pos_y         = EXCLUDED.pos_y,
+        pos_z         = EXCLUDED.pos_z,
+        yaw           = EXCLUDED.yaw,
+        state         = EXCLUDED.state,
+        online        = EXCLUDED.online,
+        hp_max        = EXCLUDED.hp_max,
+        hp            = EXCLUDED.hp,
+        stamina_max   = EXCLUDED.stamina_max,
+        stamina       = EXCLUDED.stamina,
+        mana_max      = EXCLUDED.mana_max,
+        mana          = EXCLUDED.mana,
+        rev           = EXCLUDED.rev,
+        updated_at    = now()
     WHERE player.rev < EXCLUDED.rev
 """
 
@@ -379,6 +400,39 @@ class PostgresStore(Store):
                 (device_id_hex,),
             )
 
+    def name_exists(self, user_name: str) -> bool:
+        with self.db.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM users WHERE user_name = %s LIMIT 1",
+                (user_name,),
+            )
+            return cur.fetchone() is not None
+
+    def player_file_hash(self, user_id: str) -> str:
+        with self.db.cursor() as cur:
+            cur.execute("SELECT file_hash FROM player WHERE user_id = %s", (user_id,))
+            row = cur.fetchone()
+        return _text((row or {}).get("file_hash")) if row else ""
+
+    def set_player_file_hash(self, user_id: str, file_hash: str) -> None:
+        """只在库中仍为空时写：避免把上一个客户端的哈希刷掉。
+
+        用 upsert 而不是 UPDATE：首次登录时 player 行可能还没落库
+        （注册后只在内存热缓存里，要等定时落库），否则这里会空转。
+        """
+        with self.db.conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO player (user_id, file_hash, rev)
+                VALUES (%s, %s, 0)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    file_hash  = EXCLUDED.file_hash,
+                    updated_at = now()
+                WHERE player.file_hash = ''
+                """,
+                (user_id, file_hash),
+            )
+
     # --- player ---------------------------------------------------------
     def load_players(self) -> list[dict]:
         with self.db.cursor() as cur:
@@ -390,6 +444,21 @@ class PostgresStore(Store):
         for row in rows:
             row["user_name"] = row.pop("account_name", "") or ""
         return rows
+
+    def load_player(self, user_id: str) -> dict | None:
+        with self.db.cursor() as cur:
+            cur.execute(
+                "SELECT p.*, u.user_name AS account_name "
+                "FROM player p LEFT JOIN users u ON u.user_id = p.user_id "
+                "WHERE p.user_id = %s",
+                (user_id,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return None
+        out = dict(row)
+        out["user_name"] = out.pop("account_name", "") or ""
+        return out
 
     def save_players(self, rows: Iterable[dict]) -> dict:
         pending: Sequence[dict] = [r for r in rows if _text(r.get("user_id"))]
@@ -575,6 +644,24 @@ class MemoryStore(Store):
             if dev is not None:
                 dev["last_seen_at"] = time.time()
 
+    def name_exists(self, user_name: str) -> bool:
+        with self._lock:
+            return any(u.get("user_name") == user_name for u in self._users.values())
+
+    def player_file_hash(self, user_id: str) -> str:
+        with self._lock:
+            row = self._players.get(user_id)
+            return _text((row or {}).get("file_hash"))
+
+    def set_player_file_hash(self, user_id: str, file_hash: str) -> None:
+        """同 PostgresStore：库中已有非空值则不覆盖，无行则补一行。"""
+        with self._lock:
+            row = self._players.get(user_id)
+            if row is None:
+                self._players[user_id] = {"user_id": user_id, "file_hash": _text(file_hash), "rev": 0}
+            elif not _text(row.get("file_hash")):
+                row["file_hash"] = _text(file_hash)
+
     # --- player ---------------------------------------------------------
     def load_players(self) -> list[dict]:
         names = {row.get("user_id"): row.get("user_name") or ""
@@ -586,6 +673,20 @@ class MemoryStore(Store):
                 item["user_name"] = names.get(item.get("user_id"), "")
                 out.append(item)
             return out
+
+    def load_player(self, user_id: str) -> dict | None:
+        with self._lock:
+            row = self._players.get(user_id)
+            if row is None:
+                return None
+            out = dict(row)
+        for u in self._users.values():
+            if u.get("user_id") == user_id:
+                out["user_name"] = u.get("user_name") or ""
+                break
+        else:
+            out.setdefault("user_name", "")
+        return out
 
     def save_players(self, rows: Iterable[dict]) -> dict:
         written = 0
@@ -602,6 +703,11 @@ class MemoryStore(Store):
                 stored = dict(row)
                 stored.pop("user_name", None)   # 账号名归 users 表管
                 stored["user_id"] = user_id
+                # 与 PostgresStore 的 COALESCE(NULLIF(...)) 同构：
+                # 内存行没带 player_id / file_hash 时不能把库里已有的刷空
+                for keep in ("player_id", "file_hash"):
+                    if not _text(stored.get(keep)) and current is not None:
+                        stored[keep] = _text(current.get(keep))
                 self._players[user_id] = stored
                 written += 1
         return {"written": written, "stale": stale}

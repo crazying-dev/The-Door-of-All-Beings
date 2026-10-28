@@ -24,6 +24,7 @@ MAX_CONNECTIONS                   最大并发连接数（默认 256）
 PUSH_HZ                           世界快照推送频率（默认 10）
 AUTOSAVE_INTERVAL                 内存数据落库间隔秒数（默认 60）
 USER_NAME_MAX_LEN                 用户名称最大长度（默认 24）
+GRACE_SECONDS                     意外断开后的宽限期秒数（默认 5）
 ==================================  ===========================================
 
 注意：`HOST` 只用于日志展示与调试直连，不再参与「是否启动 TCP」的判断
@@ -39,9 +40,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 ## 协议版本：报文第一行的 version 字段
-PROTOCOL_VERSION = "1.1"
+PROTOCOL_VERSION = "1.2"
 ## 服务端软件版本：随发布递增，客户端可据此提示更新
-SERVICE_VERSION = "2.0.0"
+SERVICE_VERSION = "3.0.0"
 
 ## 工程根目录（本文件所在目录），用于定位 .env / schema.sql
 BASE_DIR = Path(__file__).resolve().parent
@@ -99,6 +100,7 @@ class Config:
     push_hz: int
     autosave_interval: int
     user_name_max_len: int
+    grace_seconds: int
 
     @property
     def storage_is_memory(self) -> bool:
@@ -143,6 +145,7 @@ def load_config(env_path: Path | None = None) -> Config:
         push_hz=_env_int("PUSH_HZ", 10),
         autosave_interval=_env_int("AUTOSAVE_INTERVAL", 60),
         user_name_max_len=_env_int("USER_NAME_MAX_LEN", 24),
+        grace_seconds=_env_int("GRACE_SECONDS", 5),
     )
 
 
@@ -158,6 +161,7 @@ ENV_KEYS = (
     "DEVICE_ID_MAX_AGE", "REQUEST_TIME_WINDOW",
     "MAX_LINE_BYTES", "READ_TIMEOUT", "MAX_CONNECTIONS",
     "PUSH_HZ", "AUTOSAVE_INTERVAL", "USER_NAME_MAX_LEN",
+    "GRACE_SECONDS",
 )
 
 
@@ -192,6 +196,7 @@ def export_env(cfg: Config) -> list[str]:
         "PUSH_HZ": str(cfg.push_hz),
         "AUTOSAVE_INTERVAL": str(cfg.autosave_interval),
         "USER_NAME_MAX_LEN": str(cfg.user_name_max_len),
+        "GRACE_SECONDS": str(cfg.grace_seconds),
     }
     written: list[str] = []
     for key in ENV_KEYS:

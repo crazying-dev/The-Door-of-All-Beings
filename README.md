@@ -6,13 +6,14 @@ HTTP 发现接口已拆到独立组件 **`server`**（仓库 `server` 分支）�
 
 | 项 | 值 |
 |---|---|
-| 协议版本 | **1.1**（4 行竖线报文，长连接，10Hz 推送） |
-| 服务版本 | **2.0.0** |
+| 协议版本 | **1.2**（4 行竖线报文，长连接，会话 Token，10Hz 推送；兼容 v1.1） |
+| 服务版本 | **3.0.0** |
 | TCP 游戏端口 | `TCP_PORT`（默认跟随 `PORT`，即 **5423**） |
 | 存储 | PostgreSQL（生产）/ 内存（调试与测试） |
 | 依赖 | Python 3.12 · psycopg2-binary · python-dotenv |
 
-协议细节全部在 **[`protocol.md`](protocol.md)**（客户端对接看那一份就够）。
+协议细节全部在 **[`protocol.md`](protocol.md)**（客户端对接看那一份就够），
+业务流程（注册 / 登录 / 下线 / 宽限期重连）在 **[`flows.md`](flows.md)**。
 
 ---
 
@@ -65,9 +66,9 @@ server-socket/
 ├─ main.py          入口：Service 四阶段（s1 初始化 / s2 预热 / s3 启动 / s4 关闭）
 ├─ lifecycle.py     四阶段日志与关闭回调栈（LIFO）
 ├─ config.py        所有配置集中在这里（只从 .env / 环境变量读）
-├─ protocol.py      协议 v1.1：解析 / 编码 / 错误码
-├─ server.py        TCP 监听（create_socket → bind → start）、帧读取、单连接线程、防重放
-├─ session.py       长连接会话（Session）与会话表 + 10Hz 推送线程（SessionHub）
+├─ protocol.py      协议 v1.2：解析 / 编码 / 错误码（第 3 行兼容 2/3 字段）
+├─ server.py        TCP 监听（create_socket → bind → start）、帧读取、单连接线程、防重放、Token 校验
+├─ session.py       长连接会话（Session）与会话表 + 10Hz 推送线程 + 会话 Token + 断线宽限期
 ├─ actions.py       动作注册表（@action），业务入口
 ├─ users.py         账号业务：设备登记 / 注册 / 登录
 ├─ device_id.py     设备 ID 的签发与无状态校验（HMAC）
@@ -77,6 +78,7 @@ server-socket/
 ├─ db.py            PostgreSQL 连接池 + 自动执行 schema.sql
 ├─ schema.sql       表结构（幂等，可重复执行）
 ├─ protocol.md      协议规范（客户端对接看这份）
+├─ flows.md         业务流程规范（5 大流程与服务端动作顺序）
 ├─ deploy/          systemd 示例
 └─ scripts/
    ├─ init_db.py         建表 / 升级
@@ -93,7 +95,7 @@ server-socket/
 
 ```bash
 # 协议全链路（内存后端，起真 TCP，不用数据库）
-uv run scripts/tcp_smoke_test.py          # 当前 75/75
+uv run scripts/tcp_smoke_test.py          # 当前 110/110
 uv run scripts/tcp_smoke_test.py -v       # 逐条打印
 
 # PostgreSQL 存储层（用真库，但只碰自己造的临时数据，跑完清理）
@@ -103,8 +105,10 @@ uv run scripts/store_check.py             # 当前 25/25
 uv run main.py check
 ```
 
-`tcp_smoke_test.py` 覆盖：握手 / 设备签发与确认 / 注册 / 登录 / 重放去重 /
-哈希篡改 / 时间戳过期 / 未知动作 / 设备伪造 / 10Hz PUSH / 双客户端同屏 / 断线下线。
+`tcp_smoke_test.py` 覆盖：会话 Token 下发与校验 / 握手 / 设备签发（不落库）与确认 /
+名称查重 / 注册（带客户端 player_id UUID）/ 登录（含 file_hash 三态）/ 重放去重 /
+哈希篡改 / 时间戳过期 / 未知动作 / 设备伪造 / 10Hz PUSH / 双客户端同屏 /
+正常下线完整拆除 / 意外断开宽限期（期内重连不丢位置）/ 宽限期超时落库销毁。
 
 `store_check.py` 覆盖：users 唯一冲突归类（设备 / user_id / user_name）、SAVEPOINT 回滚不污染事务、
 登录查询与活跃时间、world + world_item 落库与 **rev 门槛三态**（落后被拒 / 相等被拒 / 领先写入）、
@@ -131,6 +135,7 @@ player 三围 + rev 门槛 + JOIN 带回账号名、`mark_all_offline`。
 | `DEBUG` | 0 | 1 = 调试日志 |
 | `MAX_LINE_BYTES` | 16384 | 单行上限（device_id hex 后 2048 字符，勿小于 4096） |
 | `READ_TIMEOUT` | 180 | 连接读超时（秒） |
+| `GRACE_SECONDS` | 5 | 已登录连接意外断开后的宽限期（秒）：期内重连接管旧会话，超时则落库并销毁 |
 | `MAX_CONNECTIONS` | 256 | 最大并发连接数 |
 | `PUSH_HZ` | 10 | 世界快照推送频率 |
 | `AUTOSAVE_INTERVAL` | 60 | 内存落库间隔（秒） |
@@ -164,7 +169,7 @@ player 三围 + rev 门槛 + JOIN 带回账号名、`mark_all_offline`。
 | 表 | 主键 | 说明 |
 |---|---|---|
 | `users` | `device_id` | 设备 + 账号。`user_id` / `user_name` 未注册时为 `NULL`（PG 的 UNIQUE 允许多个 NULL） |
-| `player` | `user_id` | 玩家数据，**一条玩家一行**：名字 / 种族 / 坐标 / 朝向 / 在线 / 三围（`hp` / `stamina` / `mana` 及各自 `_max`） |
+| `player` | `user_id` | 玩家数据，**一条玩家一行**：`player_id`（客户端 UUID）/ `file_hash`（登录文件校验）/ 名字 / 种族 / 坐标 / 朝向 / 在线 / 三围（`hp` / `stamina` / `mana` 及各自 `_max`） |
 | `world` | `id` | 世界元信息：名称 / 随机种子，默认一行 `default` = 众生之门 |
 | `world_item` | `id` | 世界实体（门 / 箱子 / 杆…），`world_id` 外键 |
 
@@ -220,13 +225,28 @@ WHERE player.rev < EXCLUDED.rev
 - 落库失败不丢数据，写 `tmp/databaseErrordb.json` 兜底
 - 重启加载时 `online` 一律强制 `False`（s2 之前已经 `mark_all_offline()`）
 
-### 8.3 长连接 + 10Hz 推送
+### 8.3 长连接 + 会话 Token + 10Hz 推送
 
 - 一个 TCP 连接 = 一个 `Session`，刚连上是匿名的，`login`/`register` 后绑定账号
+- **建连即签发 `session_token`**（`secrets.token_hex(16)`）并主动推 `PUSH | token`；
+  后续请求第 3 行带上它，不一致就 `SESSION_TOKEN_EXPIRED` + `PUSH | reset_token`
+- token 命中时不再重复查库确认绑定（只走形式校验），省下每请求 2KB 的 device_id
 - `SessionHub` 单线程按 `PUSH_HZ` 广播，世界快照每 tick 只构造一次
 - 同账号多会话时，最后一个断开才算下线（`has_user` 判定）
 
-### 8.4 防重放（有局限）
+### 8.4 断线宽限期（区分“正常下线”与“意外断开”）
+
+| 场景 | 路径 | 结果 |
+|---|---|---|
+| 客户端主动 `logout` | `actions.handle_logout` | 停推送 → 置离线 → 落库 → 销毁内存行 → 作废 token → 广播 leave |
+| 连接意外断开（含读超时） | `server._teardown` → `hub.suspend` | 挂起 `GRACE_SECONDS`，**内存行不动**（仍算在线） |
+| 期内同设备重连并 `login` | `hub.resume` | 摘掉挂起项、作废旧 token，位置/状态直接接着用 |
+| 超时 | `hub._grace_loop` → `main._on_grace_expired` | `mark_offline` → `save_player` → `destroy_player` → 广播 leave |
+| 超时后又重连 | `game.enter_world` | 内存无行时从库 `load_player` 重载（不是出生点），rev 继承库值所以能接着写 |
+
+> `destroy_player` 会抬高 `_players_rev` 种子，否则销毁后重建的行从 0 开始会被 rev 门禁拒写（真丢数据）。
+
+### 8.5 防重放（有局限）
 
 `ReplayGuard` 按「会话 + 时间戳 + 正文 sha256」去重，只拦 `register` / `device` / `item` 这类写动作。
 **跨连接重放挡不住**——协议目前没有 nonce 字段。详见 `protocol.md` §9。
@@ -269,6 +289,22 @@ ufw allow 5423/tcp
 | 测试 | 无 | `tcp_smoke_test.py` + `store_check.py` |
 
 旧 `database.py` 兼容层已删除（`users.user` 签名已改成依赖 `Store`，直接 `import users` 即可）。
+
+### 10.1 3.0 的变化（协议 v1.1 → v1.2，业务流程重构）
+
+| 方面 | v1.1（2.0） | v1.2（3.0） |
+|---|---|---|
+| 会话身份 | 每请求带 device_id（2KB）查库确认 | **建连即推 `PUSH \| token`**，第 3 行扩成 3 字段，token 命中不查库 |
+| 报文第 3 行 | `<device_id> \| <user_id>` | `<session_token> \| <device_id> \| <user_id>`（2 段仍接受） |
+| 设备登记 | `device` 签发即 `touch_device` 入库 | 签发**不落库**，到 `register` 才写 `users` |
+| 注册 | 直接 `register` | 新增 `check_name` 查重；payload 加第三段客户端 UUID `player_id` |
+| 登录 | `login` 只认 user_id | JSON payload 带 `file_hash`，不一致拒登（`FILE_HASH_MISMATCH`） |
+| 下线 | 关连接就算离线，只改 `online` | `logout` 七步完整拆除；意外断开走**宽限期** |
+| 热缓存 | 玩家行常驻 | 销毁后重连从库 `load_player` 重载，位置不丢 |
+| 错误码 | — | 新增 `BAD_SESSION_TOKEN` / `SESSION_TOKEN_EXPIRED` / `FILE_HASH_MISMATCH` |
+| 冒烟测试 | 75 项 | **110 项**（含宽限期与重连接管用例） |
+
+> 客户端（`game/code/net/`）本轮**不动**：v1.2 服务端仍接受 v1.1 报文，接上 token 后才拿到新能力。
 
 ---
 

@@ -1,11 +1,13 @@
-"""账号业务：设备登记 / 注册 / 登录。
+"""账号业务：设备登记 / 名称查重 / 注册 / 登录。
 
 约定（沿原 `my/users.py`，按新决策调整）：
 
 * **一个设备一个账号**，账号一旦绑定设备不可迁移、不可换机登录；
 * ``user_id`` 由 **服务端生成**（客户端只提交 ``user_name``），
   形如 ``ZWME-2WKQ``，字符集去掉了容易看错的 I / O / 0 / 1；
-* 设备 ID 由服务端签发（见 `device_id.py`），这里只负责「登记 + 绑定」。
+* ``player_id`` 由 **客户端生成**（UUID），仅作为本地标识随 player 行入库；
+* 设备 ID 由服务端签发（见 `device_id.py`），但**只在 register 时才落库**；
+* 登录可携带 ``file_hash``（登录校验文件哈希），服务端做完整性比对。
 
 所有方法失败时返回 ``(False, 错误码, 上下文)``，不抛异常，
 方便调用方直接映射成协议帧。错误码定义在 `protocol.py` 的 ``E_*``。
@@ -84,6 +86,26 @@ class user:
         return self.store.account_by_device(device_id_hex)
 
     # ------------------------------------------------------------------ #
+    # 名称查重
+    # ------------------------------------------------------------------ #
+
+    def check_name(self, name: str) -> bool:
+        """名称可用（未被占用）返回 True。
+
+        格式非法的名称也算「不可用」：客户端拿到 False 就回去重输入，
+        不必区分是重名还是非法字符。
+        """
+        name = (name or "").strip()
+        ok, _reason = validate_user_name(name, self.user_name_max_len)
+        if not ok:
+            return False
+        try:
+            return not self.store.name_exists(name)
+        except StoreError:
+            log.exception("名称查重时存储层报错")
+            return False
+
+    # ------------------------------------------------------------------ #
     # 注册
     # ------------------------------------------------------------------ #
 
@@ -91,14 +113,18 @@ class user:
         self,
         user_name: str,
         device_id_hex: str,
+        player_id: str = "",
         client_version: str = "",
         platform: str = "",
         ip: str = "",
     ) -> tuple[bool, str, dict]:
         """注册账号（服务端分配 user_id）。
 
+        ``player_id`` 是客户端生成的 UUID（本地唯一标识），服务端收到后
+        写进 player 行，与权威的 ``user_id`` 并存；留空时退化为 ``user_id``。
+
         返回 ``(ok, 错误码, 上下文)``；成功时上下文为
-        ``{"user_id", "user_name"}``；失败时可能带 ``account``（设备已绑定时）。
+        ``{"user_id", "user_name", "player_id"}``；失败时可能带 ``account``（设备已绑定时）。
         """
         name = user_name.strip()
         ok, reason = validate_user_name(name, self.user_name_max_len)
@@ -118,8 +144,10 @@ class user:
                 }
             }
 
+        # 设备行只在这里首次入库：device 动作不再落库（见 flows.md 流程 1）
         self.store.touch_device(device_id_hex, client_version, platform, ip)
 
+        client_player_id = (player_id or "").strip()
         for _ in range(self.MAX_ID_ATTEMPTS):
             new_id = generate_user_id()
             try:
@@ -135,7 +163,11 @@ class user:
             except StoreError:
                 log.exception("注册时存储层报错")
                 return False, protocol.E_INTERNAL, {}
-            return True, "", {"user_id": new_id, "user_name": name}
+            return True, "", {
+                "user_id": new_id,
+                "user_name": name,
+                "player_id": client_player_id or new_id,
+            }
 
         return False, protocol.E_INTERNAL, {"message": "生成用户 ID 失败，请重试"}
 
@@ -147,8 +179,16 @@ class user:
         self,
         user_id: str,
         device_id_hex: str,
+        file_hash: str | None = None,
     ) -> tuple[bool, str, dict]:
-        """登录校验：账号存在 + 设备匹配 + 状态可用 + 未锁定。"""
+        """登录校验：账号存在 + 设备匹配 + 状态可用 + 未锁定 + 文件哈希。
+
+        ``file_hash`` 三态：
+
+        * ``None`` —— 客户端没参与文件校验（v1.1 报文 / payload 不含该字段），跳过；
+        * 非空字符串 —— 与库中记录比对，不一致就拒登；库里为空则视为首次登录，回写；
+        * 空字符串 —— 与库中已有值不等则拒登。
+        """
         user_id = user_id.strip().upper()
         if not is_valid_user_id(user_id):
             return False, protocol.E_BAD_USER_ID, {"message": "用户 ID 格式不对"}
@@ -177,6 +217,24 @@ class user:
         locked_until = acc.get("locked_until")
         if locked_until is not None and _to_ts(locked_until) > time.time():
             return False, protocol.E_ACCOUNT_LOCKED, {}
+
+        # --- 登录校验文件哈希（flows.md 流程 2）--------------------------
+        if file_hash is not None:
+            try:
+                stored_hash = self.store.player_file_hash(user_id)
+            except StoreError:
+                log.exception("读文件哈希失败")
+                return False, protocol.E_INTERNAL, {}
+            if stored_hash and stored_hash != file_hash:
+                return False, protocol.E_FILE_HASH_MISMATCH, {
+                    "message": "登录校验文件与库内记录不一致",
+                }
+            if file_hash and not stored_hash:
+                # 首次登录：把当前哈希沉下来，之后都必须一致
+                try:
+                    self.store.set_player_file_hash(user_id, file_hash)
+                except StoreError:
+                    log.warning("回写文件哈希失败（不影响登录）", exc_info=True)
 
         try:
             self.store.touch_login(user_id, device_id_hex)

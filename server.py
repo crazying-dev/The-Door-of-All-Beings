@@ -26,7 +26,22 @@ log = logging.getLogger(__name__)
 
 ## 只有会改变服务端状态的动作才做重放去重；
 ## ping / peers / world / state 这类幂等读无需拦，否则会误伤客户端轮询。
-MUTATING_ACTIONS = {"register", "item", "device"}
+## v1.2 特别说明：`device` / `check_name` 已是纯读动作（device 不再写库、
+## check_name 只查名字），**不能放进这个集合** —— ts 只有秒级精度，
+## 同一秒内两次相同的只读请求会被误判为重放而回 DUPLICATE_REQUEST。
+MUTATING_ACTIONS = {"register", "item", "logout"}
+
+## 会话 Token 形状：secrets.token_hex(16) => 32 位 hex
+_TOKEN_CHARS = frozenset("0123456789abcdef")
+
+
+def _token_shape_ok(token: str) -> bool:
+    """Token 形状是否合法（32 位小写 hex）。
+
+    形状错 = 客户端代码写错了（例如把 token 截断 / 拼错），
+    与「拿的是旧 token」是两回事，因此单独回 ``BAD_SESSION_TOKEN``。
+    """
+    return len(token) == 32 and all(c in _TOKEN_CHARS for c in token.lower())
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +275,7 @@ class GameServer:
             self.stats[key] = self.stats.get(key, 0) + 1
 
     def _handle_client(self, conn: socket.socket, addr) -> None:
-        """一条连接的完整生命周期：读帧 -> 解析 -> 分发 -> 回写。"""
+        """一条连接的完整生命周期：推 Token -> 读帧 -> 解析 -> 分发 -> 回写。"""
         session = Session(conn, addr, self.hub)
         if not self.hub.add(session):
             log.warning("连接数已满，拒绝 %s", session.ip)
@@ -280,6 +295,11 @@ class GameServer:
             except OSError:
                 pass
             log.info("连接建立 session#%s %s", session.sid, session.ip)
+
+            # --- v1.2：建连立即签发并推送 Token ---
+            session.issue_token()
+            self.hub.push_token(session)
+
             reader = FrameReader(conn, self.cfg.max_line_bytes)
             self._loop(session, reader)
         except socket.timeout:
@@ -319,6 +339,27 @@ class GameServer:
         session.platform = req.platform or session.platform
         session.locale = req.locale or session.locale
 
+        # --- v1.2 Token 校验 -----------------------------------------------
+        if req.has_token and not _token_shape_ok(req.session_token):
+            # 形状就不对：客户端拼接错了，推 reset_token 只会让它无限重试，直接拒
+            self._bump("rejected")
+            return protocol.encode_fail(
+                req.action, protocol.E_BAD_TOKEN,
+                "Session token must be 32 hex chars",
+            )
+
+        if req.has_token and req.session_token != session.session_token:
+            # 本会话的 token 已被换掉 / 已作废：通常是旧客户端拿上了过期的 token。
+            # 先推一个 reset_token（告知重连后取新值），再拒掉本条请求。
+            self._bump("rejected")
+            session.send(protocol.encode_push(protocol.TOPIC_RESET_TOKEN, {
+                "reason": "expired", "action": req.action,
+            }))
+            return protocol.encode_fail(
+                req.action, protocol.E_TOKEN_EXPIRED,
+                "Token mismatch, please use the latest token",
+            )
+
         if req.action in MUTATING_ACTIONS:
             key = (session.sid, req.ts, req.body_hash)
             if self.guard.seen(key):
@@ -330,17 +371,26 @@ class GameServer:
         return actions.dispatch(req, session)
 
     def _teardown(self, session: Session) -> None:
-        was_authed = session.authenticated
-        user_id, user_name = session.user_id, session.user_name
-        session.close()
-        self.hub.remove(session)
-        if was_authed and not self.hub.has_user(user_id):
-            game.mark_offline(user_id)
-            self.hub.push_event("leave", user_id, user_name)
+        """连接断开后的处理：已认证进入宽限期，其余直接移除。
+
+        判据是 `authenticated`而不是 `_closed`：正常 logout 会先解绑账号，
+        所以“仍带着账号”就等于“这不是正常下线”（读超时 / 对端崩溃 / 中途异常）。
+        """
+        if session.authenticated:
+            # 意外断开：保留热缓存与在线标记，等宽限期扫描线程判定
+            session.close()
+            self.hub.suspend(session)
+        else:
+            user_id, user_name = session.user_id, session.user_name
+            session.close()
+            self.hub.remove(session)
+            if user_id and not self.hub.has_user(user_id):
+                game.mark_offline(user_id)
+                self.hub.push_event("leave", user_id, user_name)
         log.info(
             "连接断开 session#%s %s（在线会话 %d）",
             session.sid,
-            user_id or "anonymous",
+            session.user_id or "anonymous",
             self.hub.count(),
         )
 

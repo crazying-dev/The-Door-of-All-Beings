@@ -121,8 +121,12 @@ class Service:
 
         self.users = UserBusiness(self.store, self.cfg.user_name_max_len)
         self.hub = SessionHub(
-            push_hz=self.cfg.push_hz, max_connections=self.cfg.max_connections
+            push_hz=self.cfg.push_hz,
+            max_connections=self.cfg.max_connections,
+            grace_seconds=self.cfg.grace_seconds,
         )
+        # 宽限期超时后的销毁动作归业务层（session.py 不认识 store / game）
+        self.hub.on_grace_expired = self._on_grace_expired
         self.life.on_shutdown("hub.stop_pusher", self.hub.stop_pusher)
 
         # --- ③ 套接字创建（只建不绑，绑在 s2） ------------------------------
@@ -199,6 +203,11 @@ class Service:
             "防外挂巡检已启动" if started else "防外挂：暂无规则，巡检线程未启动"
         )
 
+        # 宽限期扫描：意外断开的会话超过 GRACE_SECONDS 才落库销毁
+        self.hub.start_grace_scanner()
+        self.life.on_shutdown("hub.stop_grace_scanner", self.hub.stop_grace_scanner)
+        self.life.step(f"掉线宽限期已启用（{self.cfg.grace_seconds} 秒）")
+
         # --- ② 套接字绑定端口 -----------------------------------------------
         host, port = self.server.bind()
         self.life.step(f"TCP 已绑定 {host}:{port}（尚未 accept）")
@@ -255,6 +264,29 @@ class Service:
     def _close_store(self) -> None:
         if self.store is not None:
             self.store.close()
+
+    def _on_grace_expired(self, session) -> None:
+        """宽限期超时（flows.md 流程 4）：落库 → 销毁 player → 作废 token。
+
+        同账号若还有其它活跃连接（已经重连成功）就只作废 token，
+        不能拆掉一个正在玩的人的数据。
+        """
+        user_id, user_name = session.user_id, session.user_name
+        session.session_token = ""
+        session.suspended = False
+
+        if not user_id:
+            return
+        if self.hub is not None and self.hub.has_user(user_id):
+            log.info("session#%s 宽限期超时，但 %s 已有新连接，保留热缓存",
+                     session.sid, user_id)
+            return
+
+        game.mark_offline(user_id)
+        game.save_player(user_id, self.store)
+        game.destroy_player(user_id)
+        self.hub.push_event("leave", user_id, user_name)
+        log.info("session#%s 宽限期超时：%s 已落库并销毁", session.sid, user_id)
 
     # ================================================================== #
     # 自检

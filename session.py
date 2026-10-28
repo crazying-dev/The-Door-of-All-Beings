@@ -1,20 +1,20 @@
-"""长连接会话与世界快照推送。
+"""长连接会话与世界快照推送（v1.2 含会话 Token + 宽限期）。
 
 一个 TCP 连接 = 一个 ``Session``：
 
+* 建连时服务端**立即签发并推送 session_token**（32 位 hex），客户端后续请求携带此 token；
 * 刚建连时是**匿名**的，只能调 ``ping`` / ``hello`` / ``device`` / ``register`` / ``login``；
 * ``register`` / ``login`` 成功后绑定账号，变成**已认证会话**，开始收 ``PUSH``；
-* 连接断了/超时/被踢，会话注销，玩家标离线（若同一账号还有别的会话则保持在线）。
+* 连接断了/超时，已认证会话进入 **5 秒宽限期**（suspended），期间可恢复；超时则落库销毁。
 
 推送节奏：单线程按 ``PUSH_HZ``（默认 10Hz）遍历所有已认证会话。
-世界快照每 tick 只构造一次（而不是每个会话构造一次），
-每个会话只在 ``world_rev`` 变了之后才多带一份 ``items``。
 """
 
 from __future__ import annotations
 
 import itertools
 import logging
+import secrets
 import socket
 import threading
 import time
@@ -26,6 +26,9 @@ log = logging.getLogger(__name__)
 
 _ids = itertools.count(1)
 
+## Token 有效期（秒）
+TOKEN_EXPIRE = 180
+
 
 class Session:
     """一条已建立的连接及其认证状态。"""
@@ -34,6 +37,7 @@ class Session:
         "sock", "addr", "sid", "user_id", "user_name", "device_id_hex",
         "client_version", "platform", "locale", "connected_at", "last_seen",
         "items_rev", "_lock", "_closed", "hub",
+        "session_token", "token_issued_at", "suspended", "suspend_deadline",
     )
 
     def __init__(self, sock: socket.socket, addr, hub: "SessionHub") -> None:
@@ -54,8 +58,32 @@ class Session:
         ## 已经推给本会话的 world 修订号
         self.items_rev = -1
 
+        ## 会话 Token（v1.2）
+        self.session_token: str = ""
+        self.token_issued_at: float = 0.0
+
+        ## 宽限期状态
+        self.suspended: bool = False
+        self.suspend_deadline: float = 0.0
+
         self._lock = threading.Lock()
         self._closed = False
+
+    # ------------------------------------------------------------------ #
+    # Token
+    # ------------------------------------------------------------------ #
+
+    def issue_token(self) -> str:
+        """签发新的会话 Token（16 字节随机 → 32 位 hex），返回 token 值。"""
+        token = secrets.token_hex(16)
+        self.session_token = token
+        self.token_issued_at = time.time()
+        return token
+
+    @property
+    def token_valid(self) -> bool:
+        """Token 是否仍然有效（非空且连接未关闭）。"""
+        return self.session_token != "" and not self._closed
 
     # ------------------------------------------------------------------ #
     # 状态
@@ -126,20 +154,33 @@ class Session:
 
 
 class SessionHub:
-    """会话注册表 + 世界快照广播线程。"""
+    """会话注册表 + 世界快照广播线程 + 宽限期管理。"""
 
-    def __init__(self, push_hz: int = 10, max_connections: int = 256) -> None:
+    def __init__(
+        self,
+        push_hz: int = 10,
+        max_connections: int = 256,
+        grace_seconds: int = 5,
+    ) -> None:
         self.push_hz = max(1, int(push_hz))
         self.max_connections = max(1, int(max_connections))
+        self.grace_seconds = max(1, int(grace_seconds))
         self._lock = threading.RLock()
         self._sessions: dict[int, Session] = {}
+        ## 掉线中的会话：key = session_token
+        self._suspended: dict[str, Session] = {}
         self._push_stop = threading.Event()
         self._push_thread: threading.Thread | None = None
+        self._grace_stop = threading.Event()
+        self._grace_thread: threading.Thread | None = None
         self._seq = 0
         self._dropped = 0
 
+        ## 宽限期过期回调（由 main.py 注入）：fn(session: Session)
+        self.on_grace_expired = None
+
     # ------------------------------------------------------------------ #
-    # 注册
+    # 注册 / 注销
     # ------------------------------------------------------------------ #
 
     def try_add(self, session: Session) -> bool:
@@ -189,6 +230,116 @@ class SessionHub:
             session.close()
         with self._lock:
             self._sessions.clear()
+        # 也清理所有挂起的
+        with self._lock:
+            self._suspended.clear()
+
+    # ------------------------------------------------------------------ #
+    # Token 推送
+    # ------------------------------------------------------------------ #
+
+    def push_token(self, session: Session) -> None:
+        """向 session 推送新签发的 token（连接建立时调用）。"""
+        frame = protocol.encode_push(protocol.TOPIC_TOKEN, {
+            "token": session.session_token,
+            "expire": TOKEN_EXPIRE,
+        })
+        session.send(frame)
+
+    def push_reset_token(self, session: Session) -> None:
+        """推送 reset_token 通知（宽限期后旧 token 作废时调用）。"""
+        frame = protocol.encode_push(protocol.TOPIC_RESET_TOKEN, {
+            "reason": "expired",
+        })
+        session.send(frame)
+
+    # ------------------------------------------------------------------ #
+    # 宽限期
+    # ------------------------------------------------------------------ #
+
+    def suspend(self, session: Session) -> None:
+        """连接意外断开后进入宽限期（仅对已认证会话有意义）。"""
+        with self._lock:
+            self._sessions.pop(session.sid, None)
+            session.suspended = True
+            session.suspend_deadline = time.time() + self.grace_seconds
+            if session.session_token:
+                self._suspended[session.session_token] = session
+            else:
+                # 没 token 就挂不住（v1.1 旧客户端）：按设备号留位，重连仍可接管
+                self._suspended[f"device:{session.device_id_hex}:{session.sid}"] = session
+        log.info(
+            "session#%s %s 进入宽限期（%ds）",
+            session.sid,
+            session.user_id or "anonymous",
+            self.grace_seconds,
+        )
+
+    def resume(self, device_id_hex: str) -> Session | None:
+        """宽限期内同设备重连：把挂起会话从销毁队列里摘掉并返回它。
+
+        返回的是**旧** session（socket 已死），只用于日志；它不会被放回
+        ``_sessions``（一条死连接不该再收推送），也不再被扫描线程销毁。
+        新连接自己已在 ``_sessions`` 里。
+        """
+        if not device_id_hex:
+            return None
+        now = time.time()
+        with self._lock:
+            for token, session in list(self._suspended.items()):
+                if session.device_id_hex != device_id_hex:
+                    continue
+                if session.suspend_deadline <= now:
+                    continue          # 已经超时，让扫描线程走正常销毁
+                del self._suspended[token]
+                session.suspended = False
+                session.session_token = ""   # 旧 token 彻底作废
+                return session
+        return None
+
+    def start_grace_scanner(self) -> None:
+        """启动宽限期扫描线程（每秒一次）。"""
+        if self._grace_thread is not None and self._grace_thread.is_alive():
+            return
+        self._grace_stop.clear()
+        self._grace_thread = threading.Thread(
+            target=self._grace_loop, name="grace-scanner", daemon=True
+        )
+        self._grace_thread.start()
+        log.info("宽限期扫描线程已启动（grace=%ds）", self.grace_seconds)
+
+    def stop_grace_scanner(self) -> None:
+        self._grace_stop.set()
+        if self._grace_thread is not None:
+            self._grace_thread.join(timeout=2.0)
+            self._grace_thread = None
+
+    def _grace_loop(self) -> None:
+        while not self._grace_stop.is_set():
+            try:
+                self._check_expired()
+            except Exception:  # noqa: BLE001
+                log.exception("宽限期扫描出错")
+            self._grace_stop.wait(1.0)
+
+    def _check_expired(self) -> None:
+        now = time.time()
+        expired: list[Session] = []
+        with self._lock:
+            for token, session in list(self._suspended.items()):
+                if session.suspend_deadline <= now:
+                    expired.append(session)
+                    del self._suspended[token]
+        for session in expired:
+            log.info(
+                "session#%s %s 宽限期超时，执行销毁",
+                session.sid, session.user_id or "?",
+            )
+            if self.on_grace_expired:
+                try:
+                    self.on_grace_expired(session)
+                except Exception:  # noqa: BLE001
+                    log.exception("on_grace_expired 回调失败")
 
     # ------------------------------------------------------------------ #
     # 广播
@@ -203,7 +354,7 @@ class SessionHub:
         )
         for session in self.authenticated_sessions():
             if session.user_id == user_id:
-                continue   # 自己不需要收自己的上下线事件
+                continue
             session.send(frame)
 
     def push_world_once(self) -> int:
@@ -222,7 +373,6 @@ class SessionHub:
             "players": players,
             "online": len(players),
         }
-        # 绝大多数会话都不需要 world 物品：先算一次带物品的版本，懒构造
         with_items: bytes | None = None
         sent = 0
         for session in self.authenticated_sessions():
@@ -264,11 +414,11 @@ class SessionHub:
             try:
                 if self.authenticated_sessions():
                     self.push_world_once()
-            except Exception:  # noqa: BLE001 - 广播线程不能死
+            except Exception:  # noqa: BLE001
                 log.exception("世界快照推送出错")
             next_at += interval
             delay = next_at - time.monotonic()
-            if delay < 0:          # 跑不动就重新对齐，不要追帧，否则越差越多
+            if delay < 0:
                 next_at = time.monotonic()
                 delay = interval
             self._push_stop.wait(delay)

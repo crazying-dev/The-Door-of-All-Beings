@@ -1,13 +1,16 @@
-"""套接字协议（v1.1）：报文解析 / 响应构造 / 错误码。
+"""套接字协议（v1.2）：报文解析 / 响应构造 / 错误码。
 
-完整规范见 protocol.md。举要：
+完整规范见 protocol.md + flows.md。举要：
 
 请求（4 行，行间 ``\\n``，整体以 ``\\n`` 结尾作为帧边界）::
 
-    TheDoorOfBings | 1.1 | <ts> | <encryption> | <client_version> | <platform> | <locale>
+    TheDoorOfBings | 1.2 | <ts> | <encryption> | <client_version> | <platform> | <locale>
     <action> | <action_data>
-    <device_id_hex> | <user_id>
+    <session_token> | <device_id_hex> | <user_id>
     <plain_hash> | <cipher_hash>
+
+第 3 行 v1.2 扩展为 3 字段（session_token | device_id | user_id），
+v1.1 客户端仍发 2 字段（device_id | user_id），服务端自动兼容。
 
 响应 / 推送（单行）::
 
@@ -15,8 +18,7 @@
     FAIL | <action> | <code> | <message>
     PUSH | <topic>  | <json>
 
-所有协议级错误也统一走 ``FAIL | - | <code> | <message>``，
-不再像 v1.0 那样返回裸文本（裸文本客户端无法可靠区分成功与失败）。
+所有协议级错误也统一走 ``FAIL | - | <code> | <message>``。
 """
 
 from __future__ import annotations
@@ -31,9 +33,9 @@ from dataclasses import dataclass, field
 # 协议常量
 # ---------------------------------------------------------------------------
 MAGIC = "TheDoorOfBings"
-## 接受的历史版本。1.0 报文头只有 4 个字段，1.1 追加了客户端信息。
-SUPPORTED_VERSIONS = ("1.0", "1.1")
-CURRENT_VERSION = "1.1"
+## 接受的历史版本。1.0 报文头只有 4 个字段，1.1 追加了客户端信息，1.2 加入会话 Token。
+SUPPORTED_VERSIONS = ("1.0", "1.1", "1.2")
+CURRENT_VERSION = "1.2"
 ## 当前只支持不加密；引入加密后把新算法加进来即可
 ENCRYPTION_METHODS = ("none",)
 
@@ -42,6 +44,8 @@ PACKET_LINES = 4
 ## 推送帧的 topic
 TOPIC_WORLD = "world"
 TOPIC_EVENT = "event"
+TOPIC_TOKEN = "token"
+TOPIC_RESET_TOKEN = "reset_token"
 
 # ---------------------------------------------------------------------------
 # 错误码（机器可读，客户端据此分支；人读说明另走 message）
@@ -69,6 +73,9 @@ E_ACCOUNT_LOCKED = "ACCOUNT_LOCKED"
 E_ACCOUNT_DISABLED = "ACCOUNT_DISABLED"
 E_INTERNAL = "INTERNAL_ERROR"
 E_SHUTTING_DOWN = "SHUTTING_DOWN"
+E_BAD_TOKEN = "BAD_SESSION_TOKEN"
+E_TOKEN_EXPIRED = "SESSION_TOKEN_EXPIRED"
+E_FILE_HASH_MISMATCH = "FILE_HASH_MISMATCH"
 
 # 错误码 -> 默认人读说明
 ERROR_MESSAGES = {
@@ -95,6 +102,9 @@ ERROR_MESSAGES = {
     E_ACCOUNT_DISABLED: "Account is not active",
     E_INTERNAL: "Internal server error",
     E_SHUTTING_DOWN: "Server is shutting down",
+    E_BAD_TOKEN: "Invalid session token",
+    E_TOKEN_EXPIRED: "Session token expired, reconnect",
+    E_FILE_HASH_MISMATCH: "Login file hash mismatch, client files were modified",
 }
 
 
@@ -123,6 +133,7 @@ class Request:
     locale: str
     action: str
     action_data: str
+    session_token: str
     device_id_hex: str
     user_id: str
     plain_hash: str
@@ -143,6 +154,10 @@ class Request:
     @property
     def has_device(self) -> bool:
         return self.device_id_hex != ""
+
+    @property
+    def has_token(self) -> bool:
+        return self.session_token != ""
 
 
 # ---------------------------------------------------------------------------
@@ -207,15 +222,23 @@ def parse_request(
     client_version, platform, locale = extra[0], extra[1], extra[2]
 
     # --- 2. 正文两行 ---------------------------------------------------
-    body = [p.split("|") for p in (_decode(lines[1]), _decode(lines[2]))]
-    if any(len(part) != 2 for part in body):
-        raise ProtocolError(E_MALFORMED, "Body lines need exactly 2 fields")
-    action = body[0][0].strip()
-    action_data = body[0][1].strip()
-    device_id_hex = body[1][0].strip()
-    user_id = body[1][1].strip()
+    # 第 2 行固定 2 字段（action | action_data）
+    line2_parts = _decode(lines[1]).split("|")
+    if len(line2_parts) != 2:
+        raise ProtocolError(E_MALFORMED, "Line 2 needs exactly 2 fields")
+    action = line2_parts[0].strip()
+    action_data = line2_parts[1].strip()
     if action == "":
         raise ProtocolError(E_MALFORMED, "Empty action")
+
+    # 第 3 行允许 2 字段（v1.1）或 3 字段（v1.2）
+    line3_parts = [p.strip() for p in _decode(lines[2]).split("|")]
+    if len(line3_parts) == 3:
+        session_token, device_id_hex, user_id = line3_parts
+    elif len(line3_parts) == 2:
+        session_token, device_id_hex, user_id = "", line3_parts[0], line3_parts[1]
+    else:
+        raise ProtocolError(E_MALFORMED, "Line 3 needs 2 or 3 fields")
 
     # --- 3. 请求尾 --------------------------------------------------------
     tail = [p.strip() for p in _decode(lines[3]).split("|")]
@@ -243,6 +266,7 @@ def parse_request(
         locale=locale,
         action=action,
         action_data=action_data,
+        session_token=session_token,
         device_id_hex=device_id_hex,
         user_id=user_id,
         plain_hash=plain_hash.lower(),
@@ -296,6 +320,7 @@ def build_request(
     device_id_hex: str = "",
     user_id: str = "",
     *,
+    session_token: str = "",
     ts: int | None = None,
     version: str = CURRENT_VERSION,
     encryption: str = "none",
@@ -303,14 +328,21 @@ def build_request(
     platform: str = "test",
     locale: str = "zh_CN",
 ) -> bytes:
-    """拼一条合法报文（以单个 ``\\n`` 结尾）。"""
+    """拼一条合法报文（以单个 ``\\n`` 结尾）。
+
+    v1.2: session_token 非空时第 3 行输出 3 字段。
+    v1.1 兼容: session_token 为空时仍输出 2 字段。
+    """
     ts = int(time.time()) if ts is None else ts
     head = (
         f"{MAGIC} | {version} | {ts} | {encryption} | "
         f"{client_version} | {platform} | {locale}"
     )
     body1 = f"{action} | {action_data}"
-    body2 = f"{device_id_hex} | {user_id}"
+    if session_token:
+        body2 = f"{session_token} | {device_id_hex} | {user_id}"
+    else:
+        body2 = f"{device_id_hex} | {user_id}"
     digest = hashlib.sha256((body1 + "\n" + body2).encode("utf-8")).hexdigest()
     return f"{head}\n{body1}\n{body2}\n{digest} | {digest}\n".encode("utf-8")
 

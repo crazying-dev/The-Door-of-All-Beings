@@ -61,6 +61,8 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at  TIMESTAMPTZ;
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS player (
     user_id     TEXT PRIMARY KEY REFERENCES users (user_id) ON DELETE CASCADE,
+    player_id   TEXT NOT NULL DEFAULT '',                 -- 客户端生成的 UUID（本地标识）
+    file_hash   TEXT NOT NULL DEFAULT '',                 -- 登录校验文件哈希（首次登录时初始化）
     player_name TEXT NOT NULL DEFAULT '',                 -- 角色名（游戏内显示）
     race        TEXT NOT NULL DEFAULT 'human',            -- 种族
     pos_x       DOUBLE PRECISION NOT NULL DEFAULT 0,      -- 最后落库的世界坐标
@@ -80,6 +82,8 @@ CREATE TABLE IF NOT EXISTS player (
 );
 
 ALTER TABLE player ADD COLUMN IF NOT EXISTS player_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE player ADD COLUMN IF NOT EXISTS player_id   TEXT NOT NULL DEFAULT '';
+ALTER TABLE player ADD COLUMN IF NOT EXISTS file_hash   TEXT NOT NULL DEFAULT '';
 ALTER TABLE player ADD COLUMN IF NOT EXISTS race        TEXT NOT NULL DEFAULT 'human';
 ALTER TABLE player ADD COLUMN IF NOT EXISTS stamina_max DOUBLE PRECISION NOT NULL DEFAULT 100;
 ALTER TABLE player ADD COLUMN IF NOT EXISTS stamina     DOUBLE PRECISION NOT NULL DEFAULT 100;
