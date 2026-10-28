@@ -1,6 +1,6 @@
 [project]
 name = "the-door-of-bings-server"
-version = "2.0.0"
+version = "3.0.0"
 description = "众生之门（The Door of All Beings）HTTP 发现服务：端点下发 + 健康检查"
 readme = "README.md"
 requires-python = ">=3.12"
