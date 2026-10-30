@@ -28,11 +28,11 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 ## 协议版本：TCP 游戏协议的版本，发现接口下发给客户端做兼容提示
-## 必须与 server-socket 组件的 PROTOCOL_VERSION 保持一致（1.2 = 会话 Token）
-PROTOCOL_VERSION = "1.2"
+## 必须与 server-socket 组件的 PROTOCOL_VERSION 保持一致（1.3 = 无主动推送 / 拉取式 + 头+正文联合哈希）
+PROTOCOL_VERSION = "1.3"
 ## 服务端软件版本：随发布递增，客户端可据此提示更新
 ## 必须与 server-socket 组件的 SERVICE_VERSION 保持一致
-SERVICE_VERSION = "3.0.0"
+SERVICE_VERSION = "4.0.0"
 
 ## 工程根目录（本文件所在目录），用于定位 .env
 BASE_DIR = Path(__file__).resolve().parent
