@@ -11,8 +11,8 @@ extends RefCounted
 ## 而且旧版本写坏过的内容（例如把 UserID 写成了 null）需要在这里统一兜住。
 ##
 ## 设备标识防篡改（协议 v1.3 / Req6）：设备 ID 文件旁配一个 .mac 校验文件，
-## 内容是 HMAC-SHA256（密钥 = 本机机器指纹 + 内置盐）对 ID 原文的签名。
-## 读取时先验签：文件被手改 / 从别的机器拷来（机器指纹不同）都会校验失败，
+## 内容是 HMAC-SHA256（密钥 = 机器指纹 + 内置盐）对 ID 原文的签名。
+## 读取时先验签：文件被手改 / 从别的机器拷来（指纹不同）都会校验失败，
 ## 此时按「本地标识被写坏」处理（清掉两份文件、向服务端重领），绝不带着脏值去请求。
 
 const DEVICE_PATH := "user://InstallationUniqueID.bin"
@@ -78,10 +78,32 @@ static func remove_file(path: String) -> void:
 ## 「拷到别的机器 / 手改文件」这一级）。真正的权威校验在服务端（HMAC 票据）。
 const _DEVICE_MAC_PEPPER := "TDOB-device-v1"
 
-## 本机校验密钥 = 机器指纹 + 盐 的 SHA256。用 OS.get_unique_id() 做机器绑定：
-## 同一份文件拷到别的机器上 MAC 对不上，直接判为篡改。
+## 本机校验密钥 = 机器指纹 + 盐 的 SHA256。Godot 4 没有跨平台的 OS.get_unique_id()，
+## 改用稳定的机器属性组合（计算机名 / 用户名 / 系统名 / 架构 / CPU 核数）：
+## 同一份文件拷到别的机器上指纹不同，MAC 对不上，直接判为篡改。
+static func _machine_fingerprint() -> String:
+	var env := OS.get_environment("COMPUTERNAME")
+	if env == "":
+		env = OS.get_environment("HOSTNAME")
+	return "%s|%s|%s|%s|%d" % [
+		env,
+		OS.get_environment("USERNAME"),
+		OS.get_name(),
+		OS.get_architecture(),
+		OS.get_processor_count(),
+	]
+
+
 static func _device_mac_key() -> PackedByteArray:
-	return sha256_hex(_DEVICE_MAC_PEPPER + "|" + OS.get_unique_id()).hex_decode()
+	return _sha256_hex(_DEVICE_MAC_PEPPER + "|" + _machine_fingerprint()).hex_decode()
+
+
+## 本文件自包含的 SHA256（hex），不依赖 code/net/tcp_client.gd。
+static func _sha256_hex(text: String) -> String:
+	var ctx := HashingContext.new()
+	ctx.start(HashingContext.HASH_SHA256)
+	ctx.update(text.to_utf8_buffer())
+	return ctx.finish().hex_encode()
 
 
 ## 对设备 ID 原文算 HMAC-SHA256，返回小写 hex。
