@@ -1997,14 +1997,6 @@ theme_override_styles/normal = SubResource("StyleBoxFlat_bhunq")
 theme_override_styles/hover = SubResource("StyleBoxFlat_w8js5")
 text = "No"
 
-[node name="waite" type="Label" parent="." unique_id=1095666871]
-layout_mode = 0
-offset_left = 23.0
-offset_top = 18.0
-offset_right = 63.0
-offset_bottom = 48.0
-label_settings = SubResource("LabelSettings_6f8o3")
-
 [connection signal="StartLoadUser" from="." to="User" method="StartLoadUser"]
 [connection signal="EndLoadUser" from="User" to="UserLoaded" method="UserLoaded"]
 [connection signal="text_submitted" from="User/Background/UserNameInput" to="User" method="GETUserName"]

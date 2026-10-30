@@ -11,7 +11,6 @@ extends Control
 
 const AccountStore = preload("res://code/StartCreen/account_store.gd")
 
-@onready var waiteLabel: Label = $"../waite"
 @onready var UserNameLabel: Label = $Panel/TextureRect/UserName
 @onready var IDLabel: Label = $Panel/TextureRect/IDL
 @onready var OKButton: Button = $Panel/TextureRect/OK
@@ -34,7 +33,7 @@ func LoadOK() -> void:
 ## 用户拒绝使用本机账号：设备锁不允许更换，提示后重新显示面板。
 func Break() -> void:
 	hide()
-	waiteLabel.text = "本机已绑定该账号，不能更换登录。\n如需更换请联系作者。"
+	print("本机已绑定该账号，不能更换登录。\n如需更换请联系作者。")
 	await get_tree().create_timer(2.5).timeout
 	show()
 
@@ -45,10 +44,10 @@ func UserLoaded(UserIsLoad) -> void:
 		return
 	var account := AccountStore.read_account()
 	if account.is_empty():
-		waiteLabel.text = "本地账号信息已损坏，暂时无法显示"
+		print("本地账号信息已损坏，暂时无法显示")
 		hide()
 		return
 	UserNameLabel.text = str(account["UserName"])
 	IDLabel.text = "ID\n" + str(account["UserID"])
-	waiteLabel.text = "用户已登录"
+	print("用户已登录")
 	show()

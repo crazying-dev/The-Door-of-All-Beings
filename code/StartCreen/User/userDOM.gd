@@ -37,7 +37,6 @@ const RETRY_DELAY := 2.0
 
 @onready var input: LineEdit = $Background/UserNameInput
 @onready var OKButton: Button = $Background/OK
-@onready var waiteLabel: Label = $"../waite"
 
 signal EndLoadUser(UserIsLoaded)
 
@@ -106,7 +105,7 @@ func _bootstrap() -> void:
 func _connect() -> bool:
 	_message = ""
 	for attempt in range(CONNECT_MAX_ATTEMPT):
-		waiteLabel.text = "正在连接账号服务器（%d/%d）..." % [attempt + 1, CONNECT_MAX_ATTEMPT]
+		print("正在连接账号服务器（%d/%d）..." % [attempt + 1, CONNECT_MAX_ATTEMPT])
 		if await _api.connect_and_hello():
 			return true
 		_message = str(_api.last_error)
@@ -170,18 +169,18 @@ func StartLoadUser(_UserIsLoad: bool = false) -> void:
 ## 输入框回车 / 点击“->”按钮触发。
 func GETUserName(text: String = "") -> void:
 	if _state == "locked":
-		waiteLabel.text = _message
+		print(_message)
 		return
 	if _state == "error":
 		await _restart()
 		return
 	var user_name := (text if text != "" else input.text).strip_edges()
 	if user_name == "":
-		waiteLabel.text = "用户名称不能为空"
+		print("用户名称不能为空")
 		input.grab_focus()
 		return
 	if user_name.length() > _name_max_len():
-		waiteLabel.text = "用户名称最多 %d 个字符" % _name_max_len()
+		print("用户名称最多 %d 个字符" % _name_max_len())
 		input.grab_focus()
 		return
 	if _working:
@@ -194,7 +193,7 @@ func GETUserName(text: String = "") -> void:
 # ================================================================ 界面状态
 
 func _apply_start() -> void:
-	waiteLabel.text = _message
+	print(_message)
 	if _resumed:
 		# 本机已有登录凭证：本次启动一律不弹 Yes/No 确认，直接进入下一个场景。
 		# 凭证已失效 / 校验不通过 / 网络不通都照样放行（按用户要求）。
@@ -221,7 +220,7 @@ func _show_input(editable: bool) -> void:
 	input.modulate.a = 1.0
 	input.editable = editable
 	input.focus_mode = Control.FOCUS_ALL if editable else Control.FOCUS_NONE
-	waiteLabel.text = _message
+	print(_message)
 	show()
 	if editable:
 		input.grab_focus()
@@ -244,7 +243,7 @@ func _goto_next() -> void:
 # ================================================================ 注册 / 找回
 
 func _register_flow(user_name: String, allow_reissue: bool) -> void:
-	waiteLabel.text = "正在注册用户..."
+	print("正在注册用户...")
 	# v1.2 新增动作 check_name：注册前先查重，避免用户填完才被告知重名。
 	# 老服务端没这个动作（回 UNKNOWN_ACTION）时视作「查不了」，直接进注册。
 	if not await _name_available(user_name):
@@ -260,23 +259,23 @@ func _register_flow(user_name: String, allow_reissue: bool) -> void:
 		"DEVICE_ALREADY_BOUND":
 			if await _adopt_bound_account():
 				return
-			waiteLabel.text = "本机已绑定其它账号，无法再注册新账号"
+			print("本机已绑定其它账号，无法再注册新账号")
 		"NAME_TAKEN":
-			waiteLabel.text = "该用户名称已被占用，请换一个"
+			print("该用户名称已被占用，请换一个")
 			input.grab_focus()
 		"BAD_DEVICE_ID":
 			if allow_reissue and await _reissue_device():
 				await _register_flow(user_name, false)
 				return
-			waiteLabel.text = "设备标识已失效，请重启客户端后重试"
+			print("设备标识已失效，请重启客户端后重试")
 		"ACCOUNT_LOCKED", "ACCOUNT_DISABLED":
-			waiteLabel.text = _friendly(res, "账号已被锁定，暂时无法注册")
+			print(_friendly(res, "账号已被锁定，暂时无法注册"))
 		_:
-			waiteLabel.text = _friendly(res, "注册失败，请稍后重试")
+			print(_friendly(res, "注册失败，请稍后重试"))
 
 
 ## 注册前的名称查重（协议 v1.2 的 check_name）。
-## 返回 true = 继续进注册（含「查不了」的情况）；返回 false = 已把提示写进 waiteLabel。
+## 返回 true = 继续进注册（含「查不了」的情况）；返回 false = 已 print 出提示（仅调试用）。
 ## 服务端把「格式非法」也算不可用，用 data.reason 区分（taken / invalid）。
 func _name_available(user_name: String) -> bool:
 	var res: Dictionary = await _api.check_name(user_name)
@@ -288,11 +287,11 @@ func _name_available(user_name: String) -> bool:
 		return true
 	match str(data.get("reason", "")):
 		"taken":
-			waiteLabel.text = "该用户名称已被占用，请换一个"
+			print("该用户名称已被占用，请换一个")
 		"invalid":
-			waiteLabel.text = "用户名称最多 %d 个字符，且不能包含空格、| 、& 或控制字符" % _name_max_len()
+			print("用户名称最多 %d 个字符，且不能包含空格、| 、& 或控制字符" % _name_max_len())
 		_:
-			waiteLabel.text = "该用户名称不可用，请换一个"
+			print("该用户名称不可用，请换一个")
 	input.grab_focus()
 	return false
 
@@ -309,7 +308,7 @@ func _adopt_bound_account() -> bool:
 	var user_name := str(account.get("user_name", "")).strip_edges()
 	var res: Dictionary = await _api.login(user_id)
 	if not bool(res.get("ok", false)):
-		waiteLabel.text = _friendly(res, "无法找回本机已绑定的账号")
+		print(_friendly(res, "无法找回本机已绑定的账号"))
 		return false
 	var data: Dictionary = res.get("data", {})
 	_finish_login(str(data.get("user_name", user_name)), str(data.get("user_id", user_id)))
@@ -326,13 +325,13 @@ func _reissue_device() -> bool:
 func _finish_login(user_name: String, user_id: String) -> void:
 	user_id = user_id.strip_edges().to_upper()
 	if user_id == "" or not AccountStore.write_account(user_name, user_id):
-		waiteLabel.text = "服务端未返回有效的用户 ID"
+		print("服务端未返回有效的用户 ID")
 		return
 	_account = {"UserName": user_name, "UserID": user_id}
 	_state = "logged_in"
 	_message = "用户已登录"
 	UserIsLoad = true
-	waiteLabel.text = "ID已获得"
+	print("ID已获得")
 	hide()
 	emit_signal("EndLoadUser", true)
 
@@ -343,7 +342,7 @@ func _restart() -> void:
 	_working = true
 	_state = "unknown"
 	_boot_done = false
-	waiteLabel.text = "正在重新连接账号服务器..."
+	print("正在重新连接账号服务器...")
 	await _bootstrap()
 	_working = false
 
