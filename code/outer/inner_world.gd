@@ -4,6 +4,8 @@ extends Node3D
 ## 全部在 _ready 里用 world_builder.gd 生成，所以改结构没必要动 .tscn，改 export 就行。
 
 const Builder = preload("res://code/outer/world_builder.gd")
+## 地图 + 出生点加载器（运行时构建，不进 .tscn）。
+const WorldMapScript := preload("res://code/outer/world_map.gd")
 
 @export_group("随机")
 @export var seed_value: int = 20210424
@@ -18,12 +20,17 @@ const Builder = preload("res://code/outer/world_builder.gd")
 
 @onready var _decoration: Node3D = $Decoration
 
+## 地图加载器实例（可能为 null：模型未导入时）。故意不写类型标注：自定义脚本静态类型会报找不到成员。
+var world_map = null
+
 var _rng := RandomNumberGenerator.new()
 var _lanterns: Array[Node3D] = []
 var _time: float = 0.0
 
 
 func _ready() -> void:
+	# 无论是否开启程序化装饰，都要先尝试加载真实地图与出生点。
+	_setup_world_map()
 	if not decorate:
 		return
 	_rng.seed = seed_value
@@ -31,6 +38,26 @@ func _ready() -> void:
 	_build_islands()
 	_build_lanterns()
 	_build_far_mountains()
+
+
+## 把 world_map 作为子节点挂在 InnerWorld 原点（与出生点模型原点重合）。加载成功则撤掉
+## 占位的 400m 平面与其盒碰撞，避免与真地形重叠穿模；失败则回收空壳、保留占位地板。
+func _setup_world_map() -> void:
+	var map = WorldMapScript.new()
+	map.name = "WorldMap"
+	add_child(map)
+	# add_child 到已在树的节点会同步触发 map._ready()，故此处 loaded 已就绪。
+	if map.loaded:
+		world_map = map
+		var floor_node := get_node_or_null("Floor")
+		if floor_node != null:
+			floor_node.visible = false
+		var floor_body := get_node_or_null("FloorBody")
+		if floor_body != null:
+			floor_body.queue_free()
+	else:
+		map.queue_free()
+		world_map = null
 
 
 func _process(delta: float) -> void:

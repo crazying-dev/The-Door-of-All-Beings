@@ -138,20 +138,25 @@ func _start_transition() -> void:
 	tween.tween_callback(_finish_transition)
 
 
-## 白到最白的那一刻：换到门内世界，并把人随机丢在落点圆内（朝向也是随机的）。
+## 白到最白的那一刻：换到门内世界，把人放到出生点平台中心（两模型原点叠合处 = InnerWorld 原点）。
+## 有地形时按地面高度把人从上方落到平台上；无存档的首帧落点在此，返回玩家随后由
+## net_sync 的「上次退出位置」覆盖。
 func _arrive() -> void:
 	_apply_world(1)
 	if _player == null:
 		return
-	var origin := _inner_world.global_position
-	var angle := randf() * TAU
-	# sqrt 是让落点在圆内“面积均匀”，不然会明显都挤在圆心附近。
-	var dist := sqrt(randf()) * ARRIVAL_RADIUS
-	var point := Vector3(origin.x + cos(angle) * dist, 0.2, origin.z + sin(angle) * dist)
+	var center := _inner_world.global_position
+	var ground_y := center.y
+	# world_map 是 inner_world.gd 的自定义属性，静态类型 Node3D 上不存，故用 Object.get 取。
+	var wm = _inner_world.get("world_map")
+	if wm != null and wm.has_method("ground_y_at_global"):
+		ground_y = float(wm.call("ground_y_at_global", center))
+	# 出生点平台顶面约 0.2m，再抬 1.5m 让人物从上方自落到平台上。
+	var point := Vector3(center.x, ground_y + 1.5, center.z)
 	_player.teleport_to_point(point, randf() * 360.0)
 	_cooldown = TELEPORT_COOLDOWN
 	# 进入门内世界这一刻才启动联机同步（只此一次）：登录 / 上报坐标 / 其它玩家代理 /
-	# 「上次退出位置」恢复都在 net_sync 内部完成（登录拿到存档坐标后会覆盖上面这个随机落点）。
+	# 「上次退出位置」恢复都在 net_sync 内部完成（登录拿到存档坐标后会覆盖上面这个落点）。
 	_setup_net_sync()
 
 
