@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 import config
@@ -104,7 +104,12 @@ def _version_block() -> dict:
 # ---------------------------------------------------------------------------
 
 def dispatch(req: protocol.Request, session: Session) -> bytes:
-    """执行一个已解析的请求，返回要回写的帧。"""
+    """执行一条已解析的请求，返回要回写的帧。
+
+    v1.3 批量：一条报文可含多个 action（``req.calls``），逐个执行、**按序**
+    拼接多行 OK/FAIL 一次性回写。身份（token/device/user）是报文级的，
+    只校验一次；失败则整包回一帧 FAIL（不逐个执行）。
+    """
     ready = _require_ready(req)
     if ready is not None:
         return ready
@@ -117,15 +122,19 @@ def dispatch(req: protocol.Request, session: Session) -> bytes:
     if bad is not None:
         return bad
 
-    handler = ACTIONS.get(req.action)
-    if handler is None:
-        return fail(req.action, E_UNKNOWN_ACTION, f"Unknown action {req.action!r}")
-
-    try:
-        return handler(req, session, _ctx)
-    except Exception:  # noqa: BLE001 - 单个请求不能把连接/服务搞挂
-        log.exception("action %s 执行失败", req.action)
-        return fail(req.action, E_INTERNAL)
+    out = b""
+    for call in req.iter_calls():
+        sub = replace(req, action=call.action, action_data=call.action_data, calls=[])
+        handler = ACTIONS.get(call.action)
+        if handler is None:
+            out += fail(call.action, E_UNKNOWN_ACTION, f"Unknown action {call.action!r}")
+            continue
+        try:
+            out += handler(sub, session, _ctx)
+        except Exception:  # noqa: BLE001 - 单个动作不能把连接/服务搞挂
+            log.exception("action %s 执行失败", call.action)
+            out += fail(call.action, E_INTERNAL)
+    return out
 
 
 def _check_identity(req: protocol.Request, session: Session) -> bytes | None:
@@ -192,15 +201,24 @@ def handle_ping(req, session, ctx) -> bytes:
 
 @action("hello")
 def handle_hello(req, session, ctx) -> bytes:
-    """握手：告诉客户端服务端版本、推送频率、可用动作。"""
+    """握手：服务端版本、可用动作，并**在响应里下发会话 Token**。
+
+    v1.3 取消了建连时的 ``PUSH | token``，改为在首个响应（hello）里把 token 带回去，
+    因此客户端第一条 hello 可以不带 token（按 2 段报文发），拿到后后续请求都带上。
+    ``push_hz`` 固定为 0：服务端不再主动推送，询问频率由客户端自定。
+    """
     session.touch()
+    if not session.session_token:
+        session.issue_token()
     return ok("hello", {
         "magic": protocol.MAGIC,
         **_version_block(),
-        "push_hz": ctx.cfg.push_hz,
+        "server_push": False,
+        "push_hz": 0,
         "autosave_interval": ctx.cfg.autosave_interval,
         "device_id_length": devid.DEFAULT_LENGTH,
         "user_name_max_len": ctx.cfg.user_name_max_len,
+        "session_token": session.session_token,
         "actions": sorted(ACTIONS.keys()),
         "now": int(time.time()),
     })
@@ -342,7 +360,6 @@ def handle_register(req, session, ctx) -> bytes:
         info["user_id"], info["user_name"], session.device_id_hex,
         race=race, player_name=info["user_name"], player_id=info["player_id"],
     )
-    ctx.hub.push_event("join", info["user_id"], info["user_name"])
     log.info("%s 注册成功 -> %s", session.describe(), info["user_id"])
     return ok("register", {
         "user_id": info["user_id"],
@@ -391,7 +408,6 @@ def handle_login(req, session, ctx) -> bytes:
         return protocol.encode_fail("login", code, message)
 
     if session.authenticated and session.user_id != info["user_id"]:
-        ctx.hub.push_event("leave", session.user_id, session.user_name)
         if not ctx.hub.has_user(session.user_id):
             game.mark_offline(session.user_id)
 
@@ -408,7 +424,6 @@ def handle_login(req, session, ctx) -> bytes:
         info["user_id"], info["user_name"], session.device_id_hex,
         player_name=info["user_name"], file_hash=file_hash or "",
     )
-    ctx.hub.push_event("join", info["user_id"], info["user_name"])
     log.info("%s 登录成功", session.describe())
     return ok("login", {
         "user_id": info["user_id"],
@@ -416,7 +431,8 @@ def handle_login(req, session, ctx) -> bytes:
         "player_id": (player or {}).get("player_id") or info["user_id"],
         "player_name": (player or {}).get("player_name", info["user_name"]),
         "race": (player or {}).get("race", game.DEFAULT_RACE),
-        "push_hz": ctx.cfg.push_hz,
+        "server_push": False,
+        "push_hz": 0,
         "session_token": session.session_token,
         **_version_block(),
     })
@@ -426,12 +442,12 @@ def handle_login(req, session, ctx) -> bytes:
 def handle_logout(req, session, ctx) -> bytes:
     """正常下线（flows.md 流程 3，动作顺序严格）。
 
-    1. 停止本会话的 10Hz 推送（解绑账号 ⇒ 不再是已认证会话）
+    1. 停止本会话的认证（解绑账号 ⇒ 不再是已认证会话）
     2. player.online = False
     3. player 内存状态 flush 进库
     4. 销毁 player 热缓存行（重连时从库重载）
     5. 作废 session_token（拿旧 token 再来的请求会被拒）
-    6. 向同世界其他玩家广播 leave
+    6. （v1.3）不再广播 leave：其他客户端拉 peers 时自然感知
     7. 回 OK，等客户端 close（服务端不抢关，避免 OK 帧被丢）
     """
     if not session.authenticated:
@@ -455,8 +471,7 @@ def handle_logout(req, session, ctx) -> bytes:
     # 5. 销毁 token
     session.session_token = ""
 
-    # 6. 广播离开
-    ctx.hub.push_event("leave", user_id, user_name)
+    # 6. （v1.3）不再主动广播 leave：其他客户端下次拉 peers 时自然看不到他
 
     log.info("session#%s 退出登录 %s（落库=%s）", session.sid, user_id, saved)
     return ok("logout", {"authenticated": False, "saved": bool(saved), "user_id": user_id})

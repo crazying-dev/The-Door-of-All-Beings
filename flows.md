@@ -8,22 +8,22 @@
 
 ## 0. 核心概念：会话 Token
 
-**每次 TCP 连接建立后，服务端立即下发一个会话 Token（`secrets.token_hex(16)`，32 位 hex）**，
-后续所有业务请求必须携带此 Token，服务端据此识别是哪个会话。
+**每次 TCP 连接建立后，服务端在内部立即签发一个会话 Token（`secrets.token_hex(16)`，32 位 hex）**，
+随**首个 `hello` 响应**下发给客户端（v1.3：不再建连主动推送），后续所有业务请求必须携带此 Token，
+服务端据此识别是哪个会话。
 
 ```
-客户端 connect TCP
-  ← 服务端主动推送：PUSH | token | {"token":"<hex32>","expire":180}
+客户端 connect TCP  →  hello  ←  OK | hello | {"…","session_token":"<hex32>","server_push":false,"push_hz":0}
 ```
 
 | 属性 | 说明 |
 |---|---|
 | 作用域 | 单条 TCP 连接（断开即失效） |
 | 用途 | 标识会话身份，替代当前「每请求都带 device_id + user_id」的方式 |
-| 生命周期 | 连接建立时签发 → 下线/超时/意外断开后销毁 |
-| 重置 | 若玩家掉线后重连，服务端可下发新 Token（旧 Token 作废） |
+| 生命周期 | hello 响应下发 → 下线/超时/意外断开后销毁 |
+| 重置 | 若玩家掉线后重连，重新走 hello 拿到新 Token（旧 Token 作废） |
 
-> **规则**：除 `hello`（握手探测）外，所有需要鉴权的请求第 1 行必须携带 `session_token` 字段。
+> **规则**：除首条 `hello`（此时还没有 token，第 3 行按 2 段发）外，所有请求第 3 行都携带 `session_token`。
 
 ---
 
@@ -84,8 +84,9 @@
 客户端                                     服务端
   │                                          │
   │  ── 连接建立 ──                           │
-  │  1. connect TCP ───────────────────────→│ accept
-  │     ←── PUSH | token | {token, expire}   │ 签发会话 Token
+  │  1. connect TCP ───────────────────────→│ accept（不发任何帧）
+  │     → hello                               │ 内部签发会话 Token
+  │     ←── OK | hello | {session_token,…}    │ 随响应下发 token
   │                                          │
   │  ── 登录请求 ──                           │
   │  2. 发送 login 请求 ───────────────────→│
@@ -95,9 +96,9 @@
   │           file_hash                      │ 校验 file_hash 与库中记录一致
   │                                          │
   │     ←── OK | login | {user_name, ...}    │ 标记 player.online = True
-  │         或 FAIL | login | <code> | <msg> │ session 绑定身份，开始 10Hz 推送
+  │         或 FAIL | login | <code> | <msg> │ session 绑定身份
   │                                          │
-  │  3. 进入世界，开始定时上报 state            │
+  │  3. 进入世界，按自选频率上报 state + 拉取 peers/world │
   │                                          │
 ```
 
@@ -105,7 +106,7 @@
 
 - **file_hash（登录校验文件哈希）**：客户端本地关键文件的哈希，服务端校验完整性；
   首次登录时由服务端初始化（register 成功后返回），后续登录时客户端必须回传一致值
-- **session_token 必须在连接建立时由服务端主动下发**，客户端无需请求
+- **session_token 随首个 `hello` 响应下发**（v1.3 不再建连主动推送），客户端存下后续都带上
 - 一个 device_id 只能绑定一个账号（永久），不做设备迁移
 
 ---
@@ -119,7 +120,6 @@
   │                                          │
   │  1. 发送 logout 请求 ──────────────────→│
   │     携带: session_token                   │ 校验 session_token
-  │                                          │ 停止 10Hz 推送
   │                                          │ player.online = False
   │                                          │ 数据落库（player + world_items 脏行）
   │                                          │ 销毁 player 内存缓存
@@ -132,13 +132,12 @@
 
 ### 服务端动作顺序（严格）
 
-1. 停止该会话的 10Hz 推送
-2. 将 player 内存状态 flush 到数据库（`game.save_one(player)`）
-3. 从 `SessionHub` 移除该 session
-4. 销毁 player 的热缓存行（后续同玩家重连时从库重新加载）
-5. Token 作废（标记为已消费）
-6. 返回 `OK | logout`
-7. 等待客户端断开 / 服务端主动关闭
+1. 将 player 内存状态 flush 到数据库（`game.save_one(player)`）
+2. 从 `SessionHub` 移除该 session
+3. 销毁 player 的热缓存行（后续同玩家重连时从库重新加载）
+4. Token 作废（标记为已消费）
+5. 返回 `OK | logout`（**不再广播 leave**：其他客户端拉 `peers` 时自然感知其消失）
+6. 等待客户端断开 / 服务端主动关闭
 
 ---
 
@@ -156,11 +155,11 @@
   │           ② 销毁 player 内存缓存
   │           ③ 销毁 session_token（标记过期）
   │           ④ player.online = False
-  │           ⑤ 向同世界其他玩家广播 PUSH event {kind:"leave"}
+  │           （v1.3：不再向其他玩家广播 leave，他们下次拉 peers 自然看不到他）
   │
   └─→ 若超时后又收到该玩家的请求（携带旧 token）→
-        服务端返回: PUSH | reset_token | {"reason":"expired"}
-        客户端收到后走【流程 5 重连】拿新 token → 重新登录 → player 从库重载
+        服务端返回: FAIL | <action> | SESSION_TOKEN_EXPIRED | …（不再附推 reset_token）
+        客户端收到后走【流程 5 重连】重新 hello 拿新 token → 重新登录 → player 从库重载
 ```
 
 ### 关键点
@@ -176,14 +175,14 @@
 ```
 客户端检测到断开（send/recv 异常 / 心跳无响应）
   │
-  ├─→ 【5 秒重连窗口】
+  ├─→ [5 秒重连窗口]
   │     │
   │     ├─ 尝试 connect 同一 host:port
   │     │     │
   │     │     ├─ 成功 →
-  │     │     │     收到 PUSH | token | {...}  （新 token）
+  │     │     │     重新发送 hello → 从响应拿新 session_token
   │     │     │     │
-  │     │     │     ├─ 若收到 PUSH | reset_token | {...} →
+  │     │     │     ├─ 若后续请求收到 SESSION_TOKEN_EXPIRED →
   │     │     │     │     更新本地 token
   │     │     │     │     重新发送 login 请求（携带新 token）
   │     │     │     │     恢复游戏世界
@@ -203,8 +202,8 @@
 ### 关键点
 
 - 客户端 **不需要也不应该** 在重连后继续使用旧 token——连接一断旧 token 即废
-- 新 token 由服务端在新连接建立时主动下发（与流程 2 步骤 1 相同）
-- `reset_token` 推送只出现在「服务端已为客户端保留了 5s 窗口但 token 已过期」的场景
+- 新 token 由服务端在新连接的 `hello` 响应里下发（与流程 2 步骤 1 相同）
+- 服务端**不再发 `reset_token` 推送**：token 失效时只回一帧 `SESSION_TOKEN_EXPIRED`，客户端据此重新 hello + login
 - 重连成功后 player 数据由服务端从库中重载（因为超时窗口可能已经销毁了缓存）
 
 ---
@@ -214,7 +213,7 @@
 ```
  ┌─────────────────────────────────────────────────────────────────┐
  │                         TCP 连接建立                              │
- │                   服务端主动推送 session_token                     │
+ │         服务端内部签发 token，随首个 hello 响应下发             │
  └────────────────────────────┬────────────────────────────────────┘
                               │
                  ┌────────────▼────────────┐
@@ -231,7 +230,7 @@
                            ▼
                  ┌───────────────────┐
                  │   进入游戏世界     │
-                 │ 10Hz 推送 + 上报   │
+                 │ 拉取 peers/world + 上报  │
                  └────────┬──────────┘
                           │
             ┌─────────────┼──────────────┐
@@ -241,19 +240,20 @@
 
 ---
 
-## 7. 报文扩展建议
+## 7. v1.3 报文变更小结
 
-以下字段需在协议 v1.2 中加入（本次重构时实现）：
+相对 v1.2，本版（v1.3）在服务端与客户端共同实现以下变更：
 
-| 位置 | 新增字段 | 说明 |
+| 位置 | 变更 | 说明 |
 |---|---|---|
-| 连接建立后首个服务端推送 | `PUSH \| token \| {"token":"hex32","expire":180}` | 签发会话 Token |
-| 请求第 1 行（header） | `session_token` 列 | 替代 device_id + user_id 的逐请求传递 |
-| 新增动作 | `check_name` | 检测名称是否重复（注册前调用） |
-| 新增推送 | `PUSH \| reset_token \| {"reason":"expired"}` | 告知客户端 token 需重置 |
-| login 请求 action_data | `file_hash` 字段 | 登录文件完整性校验 |
+| 会话 Token 下发 | 取消建连 `PUSH token` | 改为随首个 `hello` 响应的 `session_token` 字段下发 |
+| token 失效 | 取消 `PUSH reset_token` | 只回一帧 `FAIL SESSION_TOKEN_EXPIRED`，客户端自行重新 hello + login |
+| 世界/在线数据 | 取消 10Hz `PUSH world` 与 `PUSH event` | 改为客户端拉取 `peers` / `world`，频率自定（可批量） |
+| 请求尾哈希 | 仅正文哈希 → 头+正文联合哈希 | `sha256(第1行 + 第2行 + 第3行)`，改头部即失效 |
+| 第 2 行正文 | 单 action → 可批量多 action | 多组用 `;;` 连接，服务端逐个执行、按序回多帧 |
 
-> 过渡期：v1.1 请求仍可工作（不带 token 时按 device_id + user_id 鉴权），v1.2 客户端强制带 token。
+> 过渡期：v1.2 及更早报文仍被接受（哈希按仅正文算、无批量）；服务端按第 1 行的 version 自动区分。
+> `check_name` / `file_hash` / `session_token` 列等字段自 v1.2 引入以来保持不变。
 
 ---
 

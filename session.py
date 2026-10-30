@@ -1,13 +1,15 @@
-"""长连接会话与世界快照推送（v1.2 含会话 Token + 宽限期）。
+"""长连接会话（v1.3：会话 Token + 断线宽限期；不再有主动推送）。
 
 一个 TCP 连接 = 一个 ``Session``：
 
-* 建连时服务端**立即签发并推送 session_token**（32 位 hex），客户端后续请求携带此 token；
+* 建连时服务端**立即签发 session_token**（32 位 hex），随首个 ``hello`` 响应下发，
+  客户端后续请求携带此 token；
 * 刚建连时是**匿名**的，只能调 ``ping`` / ``hello`` / ``device`` / ``register`` / ``login``；
-* ``register`` / ``login`` 成功后绑定账号，变成**已认证会话**，开始收 ``PUSH``；
-* 连接断了/超时，已认证会话进入 **5 秒宽限期**（suspended），期间可恢复；超时则落库销毁。
+* ``register`` / ``login`` 成功后绑定账号，变成**已认证会话**；
+* 连接断了/超时，已认证会话进入**宽限期**（suspended），期间可恢复；超时则落库销毁。
 
-推送节奏：单线程按 ``PUSH_HZ``（默认 10Hz）遍历所有已认证会话。
+v1.3 起不再有任何主动推送：世界/玩家数据全部由客户端按需拉取（``peers`` / ``world``），
+本模块只管连接登记与宽限期扫描，不再有 10Hz 广播线程。
 """
 
 from __future__ import annotations
@@ -18,9 +20,6 @@ import secrets
 import socket
 import threading
 import time
-
-import game
-import protocol
 
 log = logging.getLogger(__name__)
 
@@ -154,26 +153,21 @@ class Session:
 
 
 class SessionHub:
-    """会话注册表 + 世界快照广播线程 + 宽限期管理。"""
+    """会话注册表 + 宽限期管理（v1.3：不再有世界快照广播线程）。"""
 
     def __init__(
         self,
-        push_hz: int = 10,
         max_connections: int = 256,
         grace_seconds: int = 5,
     ) -> None:
-        self.push_hz = max(1, int(push_hz))
         self.max_connections = max(1, int(max_connections))
         self.grace_seconds = max(1, int(grace_seconds))
         self._lock = threading.RLock()
         self._sessions: dict[int, Session] = {}
         ## 掉线中的会话：key = session_token
         self._suspended: dict[str, Session] = {}
-        self._push_stop = threading.Event()
-        self._push_thread: threading.Thread | None = None
         self._grace_stop = threading.Event()
         self._grace_thread: threading.Thread | None = None
-        self._seq = 0
         self._dropped = 0
 
         ## 宽限期过期回调（由 main.py 注入）：fn(session: Session)
@@ -233,25 +227,6 @@ class SessionHub:
         # 也清理所有挂起的
         with self._lock:
             self._suspended.clear()
-
-    # ------------------------------------------------------------------ #
-    # Token 推送
-    # ------------------------------------------------------------------ #
-
-    def push_token(self, session: Session) -> None:
-        """向 session 推送新签发的 token（连接建立时调用）。"""
-        frame = protocol.encode_push(protocol.TOPIC_TOKEN, {
-            "token": session.session_token,
-            "expire": TOKEN_EXPIRE,
-        })
-        session.send(frame)
-
-    def push_reset_token(self, session: Session) -> None:
-        """推送 reset_token 通知（宽限期后旧 token 作废时调用）。"""
-        frame = protocol.encode_push(protocol.TOPIC_RESET_TOKEN, {
-            "reason": "expired",
-        })
-        session.send(frame)
 
     # ------------------------------------------------------------------ #
     # 宽限期
@@ -342,83 +317,5 @@ class SessionHub:
                     log.exception("on_grace_expired 回调失败")
 
     # ------------------------------------------------------------------ #
-    # 广播
+    # 广播（v1.3 已全部移除：服务端不再主动推送，数据由客户端拉取）
     # ------------------------------------------------------------------ #
-
-    def push_event(self, kind: str, user_id: str, user_name: str = "") -> None:
-        """广播一条事件帧（加入 / 离开）。"""
-        frame = protocol.encode_push(
-            protocol.TOPIC_EVENT,
-            {"kind": kind, "user_id": user_id, "user_name": user_name,
-             "t": int(time.time())},
-        )
-        for session in self.authenticated_sessions():
-            if session.user_id == user_id:
-                continue
-            session.send(frame)
-
-    def push_world_once(self) -> int:
-        """推一轮世界快照；返回成功发送的会话数。"""
-        players = game.players_payload()
-        world_rev, players_rev = game.revisions()
-        with self._lock:
-            self._seq += 1
-            seq = self._seq
-        now = time.time()
-
-        base = {
-            "t": round(now, 3),
-            "seq": seq,
-            "players_rev": players_rev,
-            "players": players,
-            "online": len(players),
-        }
-        with_items: bytes | None = None
-        sent = 0
-        for session in self.authenticated_sessions():
-            if session.closed:
-                continue
-            if session.items_rev != world_rev:
-                if with_items is None:
-                    payload = dict(base)
-                    payload["items"] = game.world_payload()
-                    payload["world_rev"] = world_rev
-                    with_items = protocol.encode_push(protocol.TOPIC_WORLD, payload)
-                session.send(with_items)
-                session.items_rev = world_rev
-            else:
-                session.send(protocol.encode_push(protocol.TOPIC_WORLD, base))
-            sent += 1
-        return sent
-
-    def start_pusher(self) -> None:
-        if self._push_thread is not None and self._push_thread.is_alive():
-            return
-        self._push_stop.clear()
-        self._push_thread = threading.Thread(
-            target=self._push_loop, name="world-pusher", daemon=True
-        )
-        self._push_thread.start()
-        log.info("世界快照推送已启动（%d Hz）", self.push_hz)
-
-    def stop_pusher(self) -> None:
-        self._push_stop.set()
-        if self._push_thread is not None:
-            self._push_thread.join(timeout=2.0)
-            self._push_thread = None
-
-    def _push_loop(self) -> None:
-        interval = 1.0 / self.push_hz
-        next_at = time.monotonic()
-        while not self._push_stop.is_set():
-            try:
-                if self.authenticated_sessions():
-                    self.push_world_once()
-            except Exception:  # noqa: BLE001
-                log.exception("世界快照推送出错")
-            next_at += interval
-            delay = next_at - time.monotonic()
-            if delay < 0:
-                next_at = time.monotonic()
-                delay = interval
-            self._push_stop.wait(delay)

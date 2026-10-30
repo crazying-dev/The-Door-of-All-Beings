@@ -121,13 +121,11 @@ class Service:
 
         self.users = UserBusiness(self.store, self.cfg.user_name_max_len)
         self.hub = SessionHub(
-            push_hz=self.cfg.push_hz,
             max_connections=self.cfg.max_connections,
             grace_seconds=self.cfg.grace_seconds,
         )
         # 宽限期超时后的销毁动作归业务层（session.py 不认识 store / game）
         self.hub.on_grace_expired = self._on_grace_expired
-        self.life.on_shutdown("hub.stop_pusher", self.hub.stop_pusher)
 
         # --- ③ 套接字创建（只建不绑，绑在 s2） ------------------------------
         self.server = server_mod.GameServer(
@@ -218,14 +216,11 @@ class Service:
     # ================================================================== #
 
     def s3_start(self) -> None:
-        """① 启动套接字（accept + 推送）。"""
+        """① 启动套接字（accept）。"""
         self.life.enter("s3", "启动")
 
         self.server.start()
-        self.hub.start_pusher()
-        self.life.step(
-            f"TCP accept 循环已启动；世界推送 {self.cfg.push_hz} Hz"
-        )
+        self.life.step("TCP accept 循环已启动（v1.3：无主动推送，数据由客户端拉取）")
 
         self.life.done("服务已就绪")
         log.info("按 Ctrl+C 停止服务")
@@ -271,7 +266,7 @@ class Service:
         同账号若还有其它活跃连接（已经重连成功）就只作废 token，
         不能拆掉一个正在玩的人的数据。
         """
-        user_id, user_name = session.user_id, session.user_name
+        user_id = session.user_id
         session.session_token = ""
         session.suspended = False
 
@@ -285,7 +280,7 @@ class Service:
         game.mark_offline(user_id)
         game.save_player(user_id, self.store)
         game.destroy_player(user_id)
-        self.hub.push_event("leave", user_id, user_name)
+        # v1.3：不再广播 leave（其他客户端拉 peers 时自然感知）
         log.info("session#%s 宽限期超时：%s 已落库并销毁", session.sid, user_id)
 
     # ================================================================== #

@@ -21,7 +21,6 @@ REQUEST_TIME_WINDOW               报文时间戳容差秒数（默认 300）
 MAX_LINE_BYTES                    单行最大字节数（默认 16384）
 READ_TIMEOUT                      连接读超时秒数（默认 180）
 MAX_CONNECTIONS                   最大并发连接数（默认 256）
-PUSH_HZ                           世界快照推送频率（默认 10）
 AUTOSAVE_INTERVAL                 内存数据落库间隔秒数（默认 60）
 USER_NAME_MAX_LEN                 用户名称最大长度（默认 24）
 GRACE_SECONDS                     意外断开后的宽限期秒数（默认 5）
@@ -40,9 +39,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 ## 协议版本：报文第一行的 version 字段
-PROTOCOL_VERSION = "1.2"
+PROTOCOL_VERSION = "1.3"
 ## 服务端软件版本：随发布递增，客户端可据此提示更新
-SERVICE_VERSION = "3.0.0"
+SERVICE_VERSION = "4.0.0"
 
 ## 工程根目录（本文件所在目录），用于定位 .env / schema.sql
 BASE_DIR = Path(__file__).resolve().parent
@@ -97,7 +96,6 @@ class Config:
     max_line_bytes: int
     read_timeout: int
     max_connections: int
-    push_hz: int
     autosave_interval: int
     user_name_max_len: int
     grace_seconds: int
@@ -112,7 +110,7 @@ class Config:
             f"service={SERVICE_VERSION} protocol={PROTOCOL_VERSION} "
             f"tcp={self.tcp_bind}:{self.tcp_port} "
             f"public={self.public_host}:{self.public_port} "
-            f"db={self.db_backend} push={self.push_hz}Hz"
+            f"db={self.db_backend} push=off(pull)"
         )
 
 
@@ -142,7 +140,6 @@ def load_config(env_path: Path | None = None) -> Config:
         max_line_bytes=_env_int("MAX_LINE_BYTES", 16384),
         read_timeout=_env_int("READ_TIMEOUT", 180),
         max_connections=_env_int("MAX_CONNECTIONS", 256),
-        push_hz=_env_int("PUSH_HZ", 10),
         autosave_interval=_env_int("AUTOSAVE_INTERVAL", 60),
         user_name_max_len=_env_int("USER_NAME_MAX_LEN", 24),
         grace_seconds=_env_int("GRACE_SECONDS", 5),
@@ -160,7 +157,7 @@ ENV_KEYS = (
     "DEBUG",
     "DEVICE_ID_MAX_AGE", "REQUEST_TIME_WINDOW",
     "MAX_LINE_BYTES", "READ_TIMEOUT", "MAX_CONNECTIONS",
-    "PUSH_HZ", "AUTOSAVE_INTERVAL", "USER_NAME_MAX_LEN",
+    "AUTOSAVE_INTERVAL", "USER_NAME_MAX_LEN",
     "GRACE_SECONDS",
 )
 
@@ -193,7 +190,6 @@ def export_env(cfg: Config) -> list[str]:
         "MAX_LINE_BYTES": str(cfg.max_line_bytes),
         "READ_TIMEOUT": str(cfg.read_timeout),
         "MAX_CONNECTIONS": str(cfg.max_connections),
-        "PUSH_HZ": str(cfg.push_hz),
         "AUTOSAVE_INTERVAL": str(cfg.autosave_interval),
         "USER_NAME_MAX_LEN": str(cfg.user_name_max_len),
         "GRACE_SECONDS": str(cfg.grace_seconds),

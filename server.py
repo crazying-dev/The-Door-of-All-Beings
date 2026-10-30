@@ -296,9 +296,8 @@ class GameServer:
                 pass
             log.info("连接建立 session#%s %s", session.sid, session.ip)
 
-            # --- v1.2：建连立即签发并推送 Token ---
+            # --- v1.3：建连立即签发 Token（不推送，随 hello 响应下发） ---
             session.issue_token()
-            self.hub.push_token(session)
 
             reader = FrameReader(conn, self.cfg.max_line_bytes)
             self._loop(session, reader)
@@ -350,17 +349,14 @@ class GameServer:
 
         if req.has_token and req.session_token != session.session_token:
             # 本会话的 token 已被换掉 / 已作废：通常是旧客户端拿上了过期的 token。
-            # 先推一个 reset_token（告知重连后取新值），再拒掉本条请求。
+            # v1.3 不再回推 reset_token，只拒本条请求；客户端收到该错误码后自行重登。
             self._bump("rejected")
-            session.send(protocol.encode_push(protocol.TOPIC_RESET_TOKEN, {
-                "reason": "expired", "action": req.action,
-            }))
             return protocol.encode_fail(
                 req.action, protocol.E_TOKEN_EXPIRED,
                 "Token mismatch, please use the latest token",
             )
 
-        if req.action in MUTATING_ACTIONS:
+        if any(c.action in MUTATING_ACTIONS for c in req.calls):
             key = (session.sid, req.ts, req.body_hash)
             if self.guard.seen(key):
                 self._bump("rejected")
@@ -386,7 +382,7 @@ class GameServer:
             self.hub.remove(session)
             if user_id and not self.hub.has_user(user_id):
                 game.mark_offline(user_id)
-                self.hub.push_event("leave", user_id, user_name)
+                # v1.3：不再广播 leave（其他客户端拉 peers 时自然感知）
         log.info(
             "连接断开 session#%s %s（在线会话 %d）",
             session.sid,

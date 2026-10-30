@@ -1,22 +1,33 @@
-"""套接字协议（v1.2）：报文解析 / 响应构造 / 错误码。
+"""套接字协议（v1.3）：报文解析 / 响应构造 / 错误码。
 
 完整规范见 protocol.md + flows.md。举要：
 
 请求（4 行，行间 ``\\n``，整体以 ``\\n`` 结尾作为帧边界）::
 
-    TheDoorOfBings | 1.2 | <ts> | <encryption> | <client_version> | <platform> | <locale>
-    <action> | <action_data>
+    TheDoorOfBings | 1.3 | <ts> | <encryption> | <client_version> | <platform> | <locale>
+    <action> | <action_data>[ ;; <action> | <action_data>]*
     <session_token> | <device_id_hex> | <user_id>
     <plain_hash> | <cipher_hash>
 
-第 3 行 v1.2 扩展为 3 字段（session_token | device_id | user_id），
+v1.3 的两处不兼容变更：
+
+* **请求尾哈希改为「请求头 + 正文」联合哈希**：
+  ``plain_hash = sha256(第1行 + "\\n" + 第2行 + "\\n" + 第3行)``（逐字节，不 strip）。
+  v1.2 及更早仍按「仅正文两行」计算，服务端按 version 自动区分。
+* **第 2 行支持批量多 action**（仅 v1.3）：多个 ``action|data`` 组用 ``;;`` 连接，
+  服务端逐个执行、**按序返回多行** OK/FAIL。
+
+第 3 行 v1.2 起扩展为 3 字段（session_token | device_id | user_id），
 v1.1 客户端仍发 2 字段（device_id | user_id），服务端自动兼容。
 
 响应 / 推送（单行）::
 
     OK   | <action> | <json>
     FAIL | <action> | <code> | <message>
-    PUSH | <topic>  | <json>
+
+**v1.3 起服务端不再主动向客户端发任何帧**（取消 10Hz 世界广播、建连 token 推送、
+join/leave 事件广播）；一切数据都由客户端按需请求（``peers`` / ``world`` / ``state``），
+询问频率由客户端自行决定。``PUSH`` 帧类型保留仅为兼容老服务端，本服务端不再下发。
 
 所有协议级错误也统一走 ``FAIL | - | <code> | <message>``。
 """
@@ -33,11 +44,42 @@ from dataclasses import dataclass, field
 # 协议常量
 # ---------------------------------------------------------------------------
 MAGIC = "TheDoorOfBings"
-## 接受的历史版本。1.0 报文头只有 4 个字段，1.1 追加了客户端信息，1.2 加入会话 Token。
-SUPPORTED_VERSIONS = ("1.0", "1.1", "1.2")
-CURRENT_VERSION = "1.2"
+## 接受的历史版本。1.0 报文头只有 4 个字段，1.1 追加了客户端信息，
+## 1.2 加入会话 Token，1.3 改为「头+正文」联合哈希并支持批量多 action。
+SUPPORTED_VERSIONS = ("1.0", "1.1", "1.2", "1.3")
+CURRENT_VERSION = "1.3"
 ## 当前只支持不加密；引入加密后把新算法加进来即可
 ENCRYPTION_METHODS = ("none",)
+
+## 批量请求里分隔多个 ``action|data`` 组的分隔符（仅 v1.3）。
+BATCH_SEP = ";;"
+## 「头+正文」联合哈希、批量多 action 的最低版本（含）。
+COMBINED_HASH_MIN_VERSION = (1, 3)
+
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    """``"1.3"`` -> ``(1, 3)``；解析失败回 ``(0, 0)``（当作最旧处理）。"""
+    try:
+        return tuple(int(p) for p in version.split("."))
+    except (ValueError, AttributeError):
+        return (0, 0)
+
+
+def uses_combined_hash(version: str) -> bool:
+    """该版本是否用「请求头 + 正文」联合哈希（v1.3 起）。"""
+    return _version_tuple(version) >= COMBINED_HASH_MIN_VERSION
+
+
+# ---------------------------------------------------------------------------
+# 批量：一条请求里的单个动作
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Call:
+    """一条请求内的一个动作（v1.3 批量时一行正文可含多个）。"""
+
+    action: str
+    action_data: str
 
 ## 请求报文共几行
 PACKET_LINES = 4
@@ -140,8 +182,14 @@ class Request:
     cipher_hash: str
     ## 正文两行原文（用于防重放指纹，不含行尾换行）
     body_raw: bytes = b""
-    ## 正文 sha256 hexdigest
+    ## 正文 sha256 hexdigest（v1.3 为头+正文联合哈希，v1.2 及以前为仅正文）
     body_hash: str = ""
+    ## v1.3 批量：一条请求里的多个动作（至少一个；action/action_data 反映第一个）
+    calls: list["Call"] = field(default_factory=list)
+
+    def iter_calls(self) -> list["Call"]:
+        """要执行的动作列表（批量时多个，否则单个）。"""
+        return self.calls or [Call(self.action, self.action_data)]
 
     @property
     def device_id(self) -> bytes:
@@ -222,14 +270,33 @@ def parse_request(
     client_version, platform, locale = extra[0], extra[1], extra[2]
 
     # --- 2. 正文两行 ---------------------------------------------------
-    # 第 2 行固定 2 字段（action | action_data）
-    line2_parts = _decode(lines[1]).split("|")
-    if len(line2_parts) != 2:
-        raise ProtocolError(E_MALFORMED, "Line 2 needs exactly 2 fields")
-    action = line2_parts[0].strip()
-    action_data = line2_parts[1].strip()
-    if action == "":
-        raise ProtocolError(E_MALFORMED, "Empty action")
+    combined = uses_combined_hash(version)
+    line2_text = _decode(lines[1])
+    if combined and BATCH_SEP in line2_text:
+        # v1.3 批量：多个 ``action|data`` 组用 ``;;`` 连接
+        calls: list[Call] = []
+        for group in line2_text.split(BATCH_SEP):
+            gparts = group.split("|", 1)
+            if len(gparts) != 2:
+                raise ProtocolError(
+                    E_MALFORMED, "Each batched action needs '<action>|<data>'"
+                )
+            g_action = gparts[0].strip()
+            g_data = gparts[1].strip()
+            if g_action == "":
+                raise ProtocolError(E_MALFORMED, "Empty action in batch")
+            calls.append(Call(g_action, g_data))
+        action, action_data = calls[0].action, calls[0].action_data
+    else:
+        # 单动作：第 2 行固定 2 字段（action | action_data）
+        line2_parts = line2_text.split("|")
+        if len(line2_parts) != 2:
+            raise ProtocolError(E_MALFORMED, "Line 2 needs exactly 2 fields")
+        action = line2_parts[0].strip()
+        action_data = line2_parts[1].strip()
+        if action == "":
+            raise ProtocolError(E_MALFORMED, "Empty action")
+        calls = [Call(action, action_data)]
 
     # 第 3 行允许 2 字段（v1.1）或 3 字段（v1.2）
     line3_parts = [p.strip() for p in _decode(lines[2]).split("|")]
@@ -247,11 +314,14 @@ def parse_request(
     plain_hash, cipher_hash = tail
 
     body_raw = lines[1] + b"\n" + lines[2]
-    expected = hashlib.sha256(body_raw).hexdigest()
+    # v1.3：联合哈希覆盖「请求头 + 正文两行」；v1.2 及以前：仅正文两行。
+    # 逐字节对客户端实际发出的原文计算，不做 strip。
+    sign_raw = (lines[0] + b"\n" + body_raw) if combined else body_raw
+    expected = hashlib.sha256(sign_raw).hexdigest()
     if not hmac.compare_digest(plain_hash.lower(), expected):
         raise ProtocolError(
             E_BAD_PLAIN_HASH,
-            "Plain hash mismatch (hash the two body lines you send, byte for byte)",
+            "Plain hash mismatch (v1.3 hash header+body byte for byte; older hash the two body lines)",
         )
     # encryption=none 时密文就是明文；接入真正的加密后这里换成密文哈希
     if not hmac.compare_digest(cipher_hash.lower(), expected):
@@ -273,6 +343,7 @@ def parse_request(
         cipher_hash=cipher_hash.lower(),
         body_raw=body_raw,
         body_hash=expected,
+        calls=calls,
     )
 
 
@@ -315,7 +386,7 @@ def encode_protocol_error(err: ProtocolError) -> bytes:
 # ---------------------------------------------------------------------------
 
 def build_request(
-    action: str,
+    action: str = "",
     action_data: str = "",
     device_id_hex: str = "",
     user_id: str = "",
@@ -327,23 +398,34 @@ def build_request(
     client_version: str = "test",
     platform: str = "test",
     locale: str = "zh_CN",
+    calls: list[tuple[str, str]] | None = None,
 ) -> bytes:
     """拼一条合法报文（以单个 ``\\n`` 结尾）。
 
-    v1.2: session_token 非空时第 3 行输出 3 字段。
-    v1.1 兼容: session_token 为空时仍输出 2 字段。
+    v1.3：默认使「头+正文」联合哈希；传 ``calls=[(a1,d1),(a2,d2),...]`` 时
+    第 2 行拼接为 ``a1|d1;;a2|d2``（批量）。
+    v1.2 及以前：仍按「仅正文」哈希（老客户端逐字节兼容）。
+
+    session_token 非空时第 3 行输出 3 字段；为空时输出 2 字段（v1.1 兼容）。
     """
     ts = int(time.time()) if ts is None else ts
     head = (
         f"{MAGIC} | {version} | {ts} | {encryption} | "
         f"{client_version} | {platform} | {locale}"
     )
-    body1 = f"{action} | {action_data}"
+    if calls:
+        body1 = BATCH_SEP.join(f"{a} | {d}" for a, d in calls)
+    else:
+        body1 = f"{action} | {action_data}"
     if session_token:
         body2 = f"{session_token} | {device_id_hex} | {user_id}"
     else:
         body2 = f"{device_id_hex} | {user_id}"
-    digest = hashlib.sha256((body1 + "\n" + body2).encode("utf-8")).hexdigest()
+    if uses_combined_hash(version):
+        sign_src = head + "\n" + body1 + "\n" + body2
+    else:
+        sign_src = body1 + "\n" + body2
+    digest = hashlib.sha256(sign_src.encode("utf-8")).hexdigest()
     return f"{head}\n{body1}\n{body2}\n{digest} | {digest}\n".encode("utf-8")
 
 
