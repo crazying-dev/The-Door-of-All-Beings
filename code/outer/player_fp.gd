@@ -14,6 +14,7 @@ extends CharacterBody3D
 
 @export_group("视角 Camera")
 @export var mouse_sensitivity: float = 0.0022
+@export var touch_sensitivity: float = 0.0035
 @export var pitch_limit_degrees: float = 85.0
 
 const MAX_FALL_SPEED := 60.0
@@ -22,27 +23,50 @@ const MAX_FALL_SPEED := 60.0
 
 var _pitch_degrees: float = 0.0
 
+## 触屏控制层（方案B）。故意不写类型标注：它是自定义脚本，静态类型成 Node 会报找不到成员。
+## 仅在移动端 / 触屏设备由 world.gd 注入；为 null 时本脚本完全按键鼠走。
+var touch_controls = null
+
 
 func _ready() -> void:
 	_apply_pitch(0.0)
 
 
+func _process(_delta: float) -> void:
+	# 触屏转向：取走本帧累计的拖拽增量，按 touch_sensitivity 转成视角。
+	if touch_controls != null and touch_controls.has_method("take_look"):
+		var look: Vector2 = touch_controls.take_look()
+		if look != Vector2.ZERO:
+			_apply_look(look.x, look.y, touch_sensitivity)
+
+
 func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventMouseMotion and Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
 		var motion := event as InputEventMouseMotion
-		rotate_y(-motion.relative.x * mouse_sensitivity)
-		_apply_pitch(_pitch_degrees - rad_to_deg(motion.relative.y * mouse_sensitivity))
+		_apply_look(motion.relative.x, motion.relative.y, mouse_sensitivity)
+
+
+## 视角统一入口：鼠标相对位移与触屏拖拽增量都汇到这里，只是灵敏度不同。
+func _apply_look(delta_x: float, delta_y: float, sensitivity: float) -> void:
+	rotate_y(-delta_x * sensitivity)
+	_apply_pitch(_pitch_degrees - rad_to_deg(delta_y * sensitivity))
 
 
 func _physics_process(delta: float) -> void:
 	var input_dir := Input.get_vector("move_left", "move_right", "move_forward", "move_back")
+	var sprint := Input.is_action_pressed("sprint")
+	# 触屏激活时用摇杆轴覆盖键盘（移动平台上没有键盘），推满行程即疾行。
+	if touch_controls != null:
+		input_dir = touch_controls.move_axis
+		if bool(touch_controls.sprint_held):
+			sprint = true
 	var direction := Vector3(input_dir.x, 0.0, input_dir.y)
 	if direction.length_squared() > 1.0:
 		direction = direction.normalized()
 	direction = transform.basis * direction
 	direction.y = 0.0
 
-	var speed := run_speed if Input.is_action_pressed("sprint") else walk_speed
+	var speed := run_speed if sprint else walk_speed
 	var target := direction * speed
 	var accel := ground_acceleration if is_on_floor() else air_acceleration
 	var horizontal := Vector3(velocity.x, 0.0, velocity.z).move_toward(target, accel * delta)
@@ -50,7 +74,7 @@ func _physics_process(delta: float) -> void:
 	velocity.z = horizontal.z
 
 	if is_on_floor():
-		if Input.is_action_just_pressed("jump"):
+		if Input.is_action_just_pressed("jump") or _wants_touch_jump():
 			velocity.y = sqrt(2.0 * gravity * jump_height)
 	else:
 		velocity.y = maxf(velocity.y - gravity * delta, -MAX_FALL_SPEED)
@@ -92,3 +116,8 @@ func _apply_pitch(degrees: float) -> void:
 	_pitch_degrees = clampf(degrees, -pitch_limit_degrees, pitch_limit_degrees)
 	if _head != null:
 		_head.rotation.x = deg_to_rad(_pitch_degrees)
+
+
+## 触屏跳跃请求（落地时才取用，未取用则保留成跳跃缓冲）。
+func _wants_touch_jump() -> bool:
+	return touch_controls != null and touch_controls.has_method("take_jump") and touch_controls.take_jump()

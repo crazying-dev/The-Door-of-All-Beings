@@ -9,6 +9,9 @@ extends Node3D
 ## 门内世界目前是「只摆一块地板」的简化版：地形与装饰留到之后再补，
 ## 所以这里只保证「落得下去、站得住、能跑」，其余逻辑与最终版一致。
 
+## 方案B 触屏控制层脚本（运行时构建，不进 .tscn；键鼠平台不实例化）。
+const TouchControlsScript := preload("res://code/outer/touch_controls.gd")
+
 ## 两个世界的间距（门内世界那个 Node3D 就摆在 z = 6000）。
 ## 门外地板是 4000x4000（z 只到 ±2000），间距取 6000 是留足余量：
 ## 站到门外地板的边缘，也既看不见、也碰不到 6000 米外的门内世界。
@@ -24,6 +27,8 @@ const WIPE_OUT_TIME := 0.75
 ## 目前的简化地板远大于 30，所以一定站得住。
 const ARRIVAL_RADIUS := 22.0
 const HINT_TEXT := "WASD 移动   ·   Shift 疾行   ·   空格 跳跃   ·   走近光柱进入门内世界（单向）   ·   Esc 释放鼠标   ·   R 复位   ·   F3 调试面板（帧率 / 延迟 / 坐标）   ·   H 关闭本说明"
+## 触屏平台的提示文案（与键鼠不同源，没有 Esc / F3 / H 这些键盘操作）。
+const HINT_TEXT_TOUCH := "左侧拖动移动（推到底疾行）　·　右侧拖动转向　·　右下跳跃　·　走近光柱入门（单向）"
 
 ## 万一 project.godot 里的输入动作丢了，运行时补一份，保证一定操作得起来。
 const FALLBACK_ACTIONS := {
@@ -58,6 +63,8 @@ const FALLBACK_ACTIONS := {
 ## 一旦静态类型成 Node3D / CanvasLayer，调用 teleport_to_point() / set_wipe_progress() 就会报“找不到成员”。
 var _player
 var _hud
+## 方案B 触屏控制层（仅触屏设备创建，否则 null）。故意不写类型标注：自定义脚本静态类型成 Node 会报找不到成员。
+var _touch = null
 ## 联机同步层（code/net/net_sync.gd）。用代码挂上来而不是改 world.tscn：
 ## 场景文件不必动，未登录 / 断线时也只是静默失败，不影响单机试玩。
 ## 故意不写类型标注：net_sync.gd 上是自定义脚本，静态类型成 Node 会报找不到成员。
@@ -83,8 +90,10 @@ func _ready() -> void:
 	# 开场只切环境、不挪人：玩家就摆在 world.tscn 里那个正对光柱的起始点。
 	_apply_world(0)
 	_cooldown = 0.0
-	_hud.set_hint(HINT_TEXT)
-	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+	_setup_touch_controls()
+	if _touch == null:
+		# 键鼠平台：捕获鼠标做视角；触屏平台不捕获，视角交给拖拽手势。
+		Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 
 
 ## 只切环境 / 只点亮门内世界的太阳。
@@ -179,10 +188,12 @@ func _unhandled_input(event: InputEvent) -> void:
 		return
 
 	if event is InputEventMouseButton:
-		var click := event as InputEventMouseButton
-		if click.pressed and Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
-			Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
-			get_viewport().set_input_as_handled()
+		# 触屏平台不做鼠标捕获（触摸会被模拟成鼠标点击，误触发捕获）。
+		if _touch == null:
+			var click := event as InputEventMouseButton
+			if click.pressed and Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
+				Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+				get_viewport().set_input_as_handled()
 		return
 
 	if event.is_action_pressed("reset_player"):
@@ -219,6 +230,21 @@ func net_sync():
 ## 当前所在世界索引（0 = 门外虚空 / 1 = 门内世界）。
 func current_world() -> int:
 	return _current_world
+
+
+## 触屏 / 移动平台：运行时构建方案B 控制层并交给 player 轮询；键鼠平台直接返回（_touch 保持 null）。
+## 用 HUD（CanvasLayer）当父节点：控件直接叠在游戏画面之上，且不影响世界坐标。
+func _setup_touch_controls() -> void:
+	var use_touch := OS.has_feature("mobile") or DisplayServer.is_touchscreen_available()
+	if not use_touch:
+		_hud.set_hint(HINT_TEXT)
+		return
+	_touch = TouchControlsScript.new()
+	_touch.name = "TouchControls"
+	_hud.add_child(_touch)
+	if _player != null:
+		_player.touch_controls = _touch
+	_hud.set_hint(HINT_TEXT_TOUCH)
 
 
 func _register_fallback_actions() -> void:
