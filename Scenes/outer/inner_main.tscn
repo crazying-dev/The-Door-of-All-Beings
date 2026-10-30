@@ -1,0 +1,36 @@
+[gd_scene load_steps=6 format=3]
+
+[ext_resource type="Script" path="res://code/outer/inner_main.gd" id="1_inner_main"]
+[ext_resource type="PackedScene" path="res://Scenes/outer/inner_world.tscn" id="2_inner"]
+[ext_resource type="PackedScene" path="res://Scenes/outer/player_fp.tscn" id="3_player"]
+[ext_resource type="PackedScene" path="res://Scenes/outer/hud.tscn" id="4_hud"]
+
+[sub_resource type="Environment" id="Environment_inner"]
+background_mode = 1
+background_color = Color(0.52, 0.62, 0.78, 1)
+ambient_light_source = 2
+ambient_light_color = Color(0.62, 0.7, 0.85, 1)
+ambient_light_energy = 1.1
+reflected_light_source = 1
+tonemap_mode = 2
+glow_enabled = true
+glow_intensity = 0.6
+glow_bloom = 0.1
+fog_enabled = true
+fog_light_color = Color(0.62, 0.72, 0.88, 1)
+fog_light_energy = 0.7
+fog_density = 0.006
+fog_aerial_perspective = 0.4
+
+[node name="InnerMain" type="Node3D"]
+script = ExtResource("1_inner_main")
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("Environment_inner")
+
+[node name="InnerWorld" parent="." instance=ExtResource("2_inner")]
+
+[node name="Player" parent="." instance=ExtResource("3_player")]
+position = Vector3(0, 2, 0)
+
+[node name="HUD" parent="." instance=ExtResource("4_hud")]

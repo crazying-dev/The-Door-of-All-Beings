@@ -24,7 +24,7 @@ const MAX_FALL_SPEED := 60.0
 var _pitch_degrees: float = 0.0
 
 ## 触屏控制层（方案B）。故意不写类型标注：它是自定义脚本，静态类型成 Node 会报找不到成员。
-## 仅在移动端 / 触屏设备由 world.gd 注入；为 null 时本脚本完全按键鼠走。
+## 仅在移动端 / 触屏设备由 world_base.gd 注入；为 null 时本脚本完全按键鼠走。
 var touch_controls = null
 
 

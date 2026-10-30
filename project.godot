@@ -14,7 +14,12 @@ config/name="TheDoorOfBings"
 config/version="0.1.0"
 run/main_scene="uid://cgby7xghknab0"
 config/features=PackedStringArray("4.7", "Forward Plus")
+boot_splash/image="uid://bj004mh2saqek"
 config/icon="res://icon.svg"
+
+[autoload]
+
+GameTransition="*res://code/outer/game_transition.gd"
 
 [display]
 
@@ -80,4 +85,5 @@ toggle_help={
 [rendering]
 
 rendering_device/driver.windows="d3d12"
+renderer/rendering_method="mobile"
 textures/vram_compression/import_etc2_astc=true

@@ -10,7 +10,7 @@ extends Node
 ##   5. 意外断线时在服务端宽限期内自动重连 + 重登（flows.md 流程 4 / 5）。
 ##
 ## 设计要点：
-##   * 全部用代码 add_child 挂进场景，world.tscn 不需要（也不能轻易）改动；
+##   * 全部用代码 add_child 挂进场景，lobby / inner_main 场景文件不需要（也不能轻易）改动；
 ##   * 断线 / 未登录时静默降级，单机玩完全不受影响；
 ##   * **拉取频率由客户端把握**：PEERS_INTERVAL 越小越跟手但请求越多（可调）；
 ##   * 重连窗口取 5 秒（与服务端 GRACE_SECONDS 默认值对齐），窗口内登不回去就放弃；
@@ -81,7 +81,7 @@ func _ready() -> void:
 	set_process(false)
 
 
-## 由 world.gd 调用：注入本机玩家与远端代理挂载点，然后开始同步。
+## 由 inner_main.gd（world_base.gd）调用：注入本机玩家与远端代理挂载点，然后开始同步。
 func setup(player: Node3D, root_node: Node3D) -> void:
 	_player = player
 	_root = root_node if root_node != null else get_parent() as Node3D

@@ -1,0 +1,45 @@
+[gd_scene load_steps=9 format=3]
+
+[ext_resource type="Script" path="res://code/outer/lobby.gd" id="1_lobby"]
+[ext_resource type="PackedScene" path="res://Scenes/outer/outer_world.tscn" id="2_outer"]
+[ext_resource type="PackedScene" path="res://Scenes/outer/player_fp.tscn" id="3_player"]
+[ext_resource type="PackedScene" path="res://Scenes/outer/hud.tscn" id="4_hud"]
+[ext_resource type="Shader" path="res://shaders/void_sky.gdshader" id="5_sky"]
+
+[sub_resource type="ShaderMaterial" id="ShaderMaterial_outer_sky"]
+shader = ExtResource("5_sky")
+shader_parameter/bottom_color = Color(0, 0, 0, 1)
+shader_parameter/top_color = Color(0.36, 0.38, 0.42, 1)
+shader_parameter/fade_height = 1.0
+shader_parameter/fade_below = 0.3
+shader_parameter/dither_amount = 1.0
+
+[sub_resource type="Sky" id="Sky_outer"]
+sky_material = SubResource("ShaderMaterial_outer_sky")
+
+[sub_resource type="Environment" id="Environment_outer"]
+background_mode = 2
+sky = SubResource("Sky_outer")
+ambient_light_source = 1
+reflected_light_source = 1
+tonemap_mode = 2
+glow_enabled = true
+glow_intensity = 1.1
+glow_bloom = 0.25
+glow_hdr_threshold = 0.85
+
+[node name="Lobby" type="Node3D"]
+script = ExtResource("1_lobby")
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("Environment_outer")
+
+[node name="OuterWorld" parent="." instance=ExtResource("2_outer")]
+
+[node name="Player" parent="." instance=ExtResource("3_player")]
+position = Vector3(0, 0.1, 16)
+
+[node name="Spawn" type="Node3D" parent="."]
+position = Vector3(0, 0.1, 16)
+
+[node name="HUD" parent="." instance=ExtResource("4_hud")]

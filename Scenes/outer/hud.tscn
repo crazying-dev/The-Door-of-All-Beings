@@ -1,0 +1,125 @@
+[gd_scene load_steps=5 format=3]
+
+[ext_resource type="Script" path="res://code/outer/hud.gd" id="1_hud"]
+[ext_resource type="Shader" path="res://shaders/white_wipe.gdshader" id="2_wipe"]
+
+[sub_resource type="SystemFont" id="SystemFont_ui"]
+font_names = PackedStringArray("Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", "sans-serif")
+
+[sub_resource type="ShaderMaterial" id="ShaderMaterial_wipe"]
+shader = ExtResource("2_wipe")
+shader_parameter/wipe_color = Color(1, 1, 1, 1)
+shader_parameter/progress = 0.0
+shader_parameter/softness = 0.42
+shader_parameter/fade = 0.0
+shader_parameter/aspect = 1.77778
+
+[node name="HUD" type="CanvasLayer"]
+script = ExtResource("1_hud")
+
+[node name="HintLabel" type="Label" parent="."]
+visible = false
+anchors_preset = 5
+anchor_left = 0.5
+anchor_right = 0.5
+offset_left = -520.0
+offset_top = 34.0
+offset_right = 520.0
+offset_bottom = 66.0
+grow_horizontal = 2
+mouse_filter = 2
+theme_override_colors/font_color = Color(0.8, 0.9, 1, 0.78)
+theme_override_colors/font_outline_color = Color(0, 0.05, 0.1, 1)
+theme_override_constants/outline_size = 6
+theme_override_fonts/font = SubResource("SystemFont_ui")
+theme_override_font_sizes/font_size = 18
+horizontal_alignment = 1
+vertical_alignment = 1
+
+[node name="InfoPanel" type="PanelContainer" parent="."]
+visible = false
+offset_left = 22.0
+offset_top = 20.0
+offset_right = 430.0
+offset_bottom = 210.0
+mouse_filter = 2
+
+[node name="VBox" type="VBoxContainer" parent="InfoPanel"]
+layout_mode = 2
+mouse_filter = 2
+theme_override_constants/separation = 4
+
+[node name="Title" type="Label" parent="InfoPanel/VBox"]
+layout_mode = 2
+mouse_filter = 2
+theme_override_colors/font_color = Color(0.7, 0.92, 1, 0.95)
+theme_override_fonts/font = SubResource("SystemFont_ui")
+theme_override_font_sizes/font_size = 17
+text = "众生之门 · 第一人称（同人复刻）"
+
+[node name="Help" type="Label" parent="InfoPanel/VBox"]
+layout_mode = 2
+mouse_filter = 2
+theme_override_colors/font_color = Color(0.76, 0.86, 0.96, 0.72)
+theme_override_fonts/font = SubResource("SystemFont_ui")
+theme_override_font_sizes/font_size = 14
+text = "非官方同人 · 仅供学习交流 · 非商业用途"
+
+[node name="Fps" type="Label" parent="InfoPanel/VBox"]
+layout_mode = 2
+mouse_filter = 2
+theme_override_colors/font_color = Color(0.76, 0.86, 0.96, 0.72)
+theme_override_fonts/font = SubResource("SystemFont_ui")
+theme_override_font_sizes/font_size = 14
+text = "帧率 0 FPS"
+
+[node name="Latency" type="Label" parent="InfoPanel/VBox"]
+layout_mode = 2
+mouse_filter = 2
+theme_override_colors/font_color = Color(0.76, 0.86, 0.96, 0.72)
+theme_override_fonts/font = SubResource("SystemFont_ui")
+theme_override_font_sizes/font_size = 14
+text = "延迟 —（未连接）"
+
+[node name="Speed" type="Label" parent="InfoPanel/VBox"]
+layout_mode = 2
+mouse_filter = 2
+theme_override_colors/font_color = Color(0.76, 0.86, 0.96, 0.72)
+theme_override_fonts/font = SubResource("SystemFont_ui")
+theme_override_font_sizes/font_size = 14
+text = "速度 0.0 m/s"
+
+[node name="Coords" type="Label" parent="InfoPanel/VBox"]
+layout_mode = 2
+mouse_filter = 2
+theme_override_colors/font_color = Color(0.76, 0.86, 0.96, 0.72)
+theme_override_fonts/font = SubResource("SystemFont_ui")
+theme_override_font_sizes/font_size = 14
+text = "坐标 X 0.0   Y 0.0   Z 0.0"
+
+[node name="Facing" type="Label" parent="InfoPanel/VBox"]
+layout_mode = 2
+mouse_filter = 2
+theme_override_colors/font_color = Color(0.76, 0.86, 0.96, 0.72)
+theme_override_fonts/font = SubResource("SystemFont_ui")
+theme_override_font_sizes/font_size = 14
+text = "朝向 北（0°）"
+
+[node name="Flash" type="ColorRect" parent="."]
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+color = Color(1, 1, 1, 0)
+
+[node name="Wipe" type="ColorRect" parent="."]
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+grow_horizontal = 2
+grow_vertical = 2
+mouse_filter = 2
+material = SubResource("ShaderMaterial_wipe")
+color = Color(1, 1, 1, 1)

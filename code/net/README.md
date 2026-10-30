@@ -17,8 +17,8 @@ StartCreen.tscn / User(userDOM.gd)
   → GameApi.connect_and_hello()      握手；TCP 建连后先等 `PUSH | token`
   → GameApi.ensure_device()          本地有 hex 就“确认”，没有就申一张（服务端签发）
   → 本地有账号 ? login(user_id) : check_name(name) → register(name, race)
-  → 进入下一场景（race.tscn → world.tscn）
-        → net_sync.setup(player, world)
+  → 进入下一场景（race.tscn → lobby.tscn 门外大厅，纯离线；穿光柱换到 inner_main.tscn）
+        → 进门内世界时 net_sync.setup(player, inner_main)
         → GameApi.login_with_saved_account()   重新建连并静默登录
         → _process 里每 0.1s 上报 state，同时收 PUSH world
         → 意外断线：5s 宽限期内自动重连 + 重登，失败就静默降级单机
@@ -66,7 +66,7 @@ uv run main.py serve
 
 ## F3 调试面板的帧率 / 延迟
 
-- **帧率**：`Engine.get_frames_per_second()`（上一秒的平均值），`world.gd` 每 0.1s 刷一次。
+- **帧率**：`Engine.get_frames_per_second()`（上一秒的平均值），`world_base.gd` 每 0.1s 刷一次。
 - **延迟**：不是单独发 `ping`，而是直接量**每次请求的往返耗时**——
   `tcp_client` 在发车前记 `Time.get_ticks_usec()`，收到对应响应时算差值，
   `last_rtt_ms` 是原始值、`avg_rtt_ms` 是指数平滑值（`RTT_SMOOTH = 0.25`）。
