@@ -425,12 +425,19 @@ def handle_login(req, session, ctx) -> bytes:
         player_name=info["user_name"], file_hash=file_hash or "",
     )
     log.info("%s 登录成功", session.describe())
+    # 把该玩家「上次退出的位置」（enter_world 已从库/缓存恢复的坐标）一并回写，
+    # 供客户端进世界时把本机玩家放到原位——否则客户端会用场景默认出生点覆盖掉存档位置。
+    prow = player or {}
     return ok("login", {
         "user_id": info["user_id"],
         "user_name": info["user_name"],
-        "player_id": (player or {}).get("player_id") or info["user_id"],
-        "player_name": (player or {}).get("player_name", info["user_name"]),
-        "race": (player or {}).get("race", game.DEFAULT_RACE),
+        "player_id": prow.get("player_id") or info["user_id"],
+        "player_name": prow.get("player_name", info["user_name"]),
+        "race": prow.get("race", game.DEFAULT_RACE),
+        "pos_x": prow.get("pos_x", 0.0),
+        "pos_y": prow.get("pos_y", 0.0),
+        "pos_z": prow.get("pos_z", 0.0),
+        "yaw": prow.get("yaw", 0.0),
         "server_push": False,
         "push_hz": 0,
         "session_token": session.session_token,

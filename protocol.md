@@ -282,9 +282,14 @@ OK | register | {"user_id":"ZWME-2WKQ","user_name":"勇者",
 ```
 OK | login | {"user_id":"ZWME-2WKQ","user_name":"勇者",
               "player_id":"a3f1c8d2-…","player_name":"勇者","race":"human",
+              "pos_x":12.5,"pos_y":0.0,"pos_z":-8.0,"yaw":90.0,
               "server_push":false,"push_hz":0,"session_token":"9f2c…(32 hex)",
               "server_version":"4.0.0","protocol_version":"1.3"}
 ```
+
+> `pos_x/pos_y/pos_z/yaw` 是该玩家**上次退出的存档位置**（`enter_world` 已从库/缓存恢复），
+> 客户端进世界首帧应先把本机玩家放到这一点、**再**开始 `state` 上报，否则会用场景默认出生点
+> 覆盖掉存档位置。断线重连不重放（人已在地里）。yaw 单位度，0 = 正北 / -Z，顺时针为正。
 
 `logout` 响应：
 
