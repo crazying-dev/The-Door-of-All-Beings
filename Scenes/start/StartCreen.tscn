@@ -1,4 +1,4 @@
-﻿[gd_scene format=4 uid="uid://cgby7xghknab0"]
+[gd_scene format=4 uid="uid://cgby7xghknab0"]
 
 [ext_resource type="Script" uid="uid://ckmx5dd48r565" path="res://code/StartCreen/StartCreen.gd" id="1_1odya"]
 [ext_resource type="FontFile" uid="uid://cnuj13qgsulnj" path="res://assets/font/KNMaiyuan-Regular.ttf" id="2_k3akb"]
