@@ -194,9 +194,10 @@ func GETUserName(text: String = "") -> void:
 
 func _apply_start() -> void:
 	print(_message)
-	if _resumed:
-		# 本机已有登录凭证：本次启动一律不弹 Yes/No 确认，直接进入下一个场景。
-		# 凭证已失效 / 校验不通过 / 网络不通都照样放行（按用户要求）。
+	# 本机已有登录凭证：默认不弹 Yes/No 确认、直接进入下一个场景（校验不通过 / 网络不通也照样放行，按用户要求）。
+	# 但账号「不存在」被清空、需要重新起名的（need_name）必须停下来弹输入框，
+	# 否则提示了「请重新输入用户名称」却又无名自动进世界，前后矛盾。
+	if _resumed and _state != "need_name":
 		UserIsLoad = true
 		hide()
 		_goto_next()
