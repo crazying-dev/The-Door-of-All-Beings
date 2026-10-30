@@ -6,6 +6,9 @@ extends Node3D
 ## 走近光柱 -> 白光由远及近铺满屏幕 -> 被随机丢进门内世界的灵质台上（全程不锁操作）。
 ## 单向：门内世界不再放门，进去就回不来。
 ##
+## 联机只在门内世界启用：门外是固定出生点的纯等待进入界面 —— 不登录 / 不上报坐标 /
+## 不显示其它玩家 / 不瞬移到存档位置。net_sync 推迟到穿过光柱（_arrive）才第一次拉起。
+##
 ## 门内世界目前是「只摆一块地板」的简化版：地形与装饰留到之后再补，
 ## 所以这里只保证「落得下去、站得住、能跑」，其余逻辑与最终版一致。
 
@@ -67,6 +70,7 @@ var _hud
 var _touch = null
 ## 联机同步层（code/net/net_sync.gd）。用代码挂上来而不是改 world.tscn：
 ## 场景文件不必动，未登录 / 断线时也只是静默失败，不影响单机试玩。
+## 不在 _ready 创建：门外等待期保持离线，直到 _arrive() 进入门内世界才第一次拉起。
 ## 故意不写类型标注：net_sync.gd 上是自定义脚本，静态类型成 Node 会报找不到成员。
 var _net_sync = null
 
@@ -82,7 +86,8 @@ func _ready() -> void:
 
 	_player = $Player
 	_hud = $HUD
-	_setup_net_sync()
+	# 联机同步不在这里启动：门外是纯等待进入界面（不联机 / 不上报坐标 / 固定出生点），
+	# 等玩家穿过光柱进入门内世界后，由 _arrive() 第一次拉起 net_sync（见 _setup_net_sync）。
 
 	# 用字符串形式连接信号：光柱脚本自定义了 gate_entered，静态类型 Node 上找不到它。
 	_pillar.connect("gate_entered", _on_gate_entered)
@@ -145,6 +150,9 @@ func _arrive() -> void:
 	var point := Vector3(origin.x + cos(angle) * dist, 0.2, origin.z + sin(angle) * dist)
 	_player.teleport_to_point(point, randf() * 360.0)
 	_cooldown = TELEPORT_COOLDOWN
+	# 进入门内世界这一刻才启动联机同步（只此一次）：登录 / 上报坐标 / 其它玩家代理 /
+	# 「上次退出位置」恢复都在 net_sync 内部完成（登录拿到存档坐标后会覆盖上面这个随机落点）。
+	_setup_net_sync()
 
 
 ## 白闪淡出结束：把白幕归零，并允许下一次触发。
@@ -211,7 +219,10 @@ func _respawn() -> void:
 		_hud.flash_white()
 
 
+## 联机同步层只在进入门内世界后启动一次（_arrive 调用）；门外等待期保持离线，_net_sync 为 null。
 func _setup_net_sync() -> void:
+	if _net_sync != null:
+		return
 	var script: Variant = load("res://code/net/net_sync.gd")
 	if script == null:
 		push_warning("未找到 net_sync.gd，联机同步已关闭")
