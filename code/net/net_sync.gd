@@ -3,23 +3,26 @@ extends Node
 ##
 ## 职责：
 ##   1. 进入世界后用本地账号静默重登（code/net/game_api.gd::login_with_saved_account）；
-##   2. 以 10Hz 上报本机玩家的坐标 / 朝向 / 动作；
-##   3. 消费服务端 10Hz 的 PUSH world，把其它玩家渲染成 player.tscn 的线条骨架代理，
-##      位置做插值，动作按 state 字段切 walk / idle；
-##   4. 收到 PUSH event（join / leave）时增删代理。
+##   2. 以本地可配的间隔上报本机玩家的坐标 / 朝向 / 动作（STATE_INTERVAL）；
+##   3. **主动拉取**在线玩家快照（PEERS_INTERVAL），把其它玩家渲染成 player.tscn 的
+##      线条骨架代理，位置做插值，动作按 state 字段切 walk / idle（v1.3：服务端不再推）；
+##   4. 某个玩家从 peers 里消失就地拆代理（取代旧 PUSH event join/leave）。
 ##   5. 意外断线时在服务端宽限期内自动重连 + 重登（flows.md 流程 4 / 5）。
 ##
 ## 设计要点：
 ##   * 全部用代码 add_child 挂进场景，world.tscn 不需要（也不能轻易）改动；
 ##   * 断线 / 未登录时静默降级，单机玩完全不受影响；
+##   * **拉取频率由客户端把握**：PEERS_INTERVAL 越小越跟手但请求越多（可调）；
 ##   * 重连窗口取 5 秒（与服务端 GRACE_SECONDS 默认值对齐），窗口内登不回去就放弃；
 ##   * 远端代理是 player.tscn 的实例，preview_keys 关掉，免得按 1/2/3 也切它们的动画。
 
 const GameApi = preload("res://code/net/game_api.gd")
 const PlayerScene = preload("res://Scenes/actors/player.tscn")
 
-## 上报间隔（秒）。与服务端 PUSH_HZ 对齐。
+## 上报间隔（秒）。拉取频率由客户端自定（v1.3）。可调小以提跟手度。
 const STATE_INTERVAL := 0.1
+## 拉取在线玩家快照的间隔（秒）。取代旧 10Hz PUSH world，频率由客户端把握。
+const PEERS_INTERVAL := 0.1
 ## 远端代理位置插值速度（越大越“硬”）。
 const LERP_SPEED := 8.0
 ## 速度高于这个值就当走路（与服务端 state 字段的两档对齐）。
@@ -50,6 +53,7 @@ var _root: Node3D = null
 var _avatars: Dictionary = {}
 var _targets: Dictionary = {}
 var _accum := 0.0
+var _peers_accum := 0.0
 var _busy := false
 ## 当前在线人数（含自己）。
 var online_count := 0
@@ -69,8 +73,7 @@ func _ready() -> void:
 	_api = GameApi.new()
 	_api.name = "GameApi"
 	add_child(_api)
-	_api.world_pushed.connect(_on_world)
-	_api.event_pushed.connect(_on_event)
+	# v1.3：不再消费服务端 PUSH（已取消），在线数据改为主循环里轮询 peers。
 	_api.authenticated_changed.connect(_on_authenticated)
 	var tcp = _api.tcp()
 	if tcp != null:
@@ -104,8 +107,8 @@ func _login_now() -> bool:
 ## 登录成功后的共同收尾：打日志 + 拉世界快照 + 开主循环。
 ## 首次进入与断线重连都走这里，避免两份逻辑走歪。
 func _after_login() -> void:
-	print("联机同步已就绪：%s @ 服务端 %s（协议 %s，推送 %.0fHz）" % [
-		_api.user_name, _api.server_version, _api.protocol_version, _api.push_hz,
+	print("联机同步已就绪：%s @ 服务端 %s（协议 %s，拉取间隔 %.2fs）" % [
+		_api.user_name, _api.server_version, _api.protocol_version, PEERS_INTERVAL,
 	])
 	if not is_inside_tree():
 		return
@@ -167,11 +170,18 @@ func _process(delta: float) -> void:
 	if not bool(_api.authenticated):
 		return
 	_accum += delta
-	if _accum < STATE_INTERVAL:
+	_peers_accum += delta
+	var do_state := _accum >= STATE_INTERVAL
+	var do_peers := _peers_accum >= PEERS_INTERVAL
+	if not do_state and not do_peers:
 		return
-	_accum = 0.0
 	_busy = true
-	await _push_state()
+	if do_state:
+		_accum = 0.0
+		await _push_state()
+	if do_peers:
+		_peers_accum = 0.0
+		await _poll_peers()
 	_busy = false
 
 
@@ -195,11 +205,16 @@ func _push_state() -> void:
 
 # ---------------------------------------------------------------- 远端代理
 
-func _on_world(payload: Dictionary) -> void:
+## 拉一次在线玩家快照（取代旧 PUSH world）。拉到的数据交给 _apply_players 重绘代理。
+func _poll_peers() -> void:
+	var res: Dictionary = await _api.fetch_peers()
+	if bool(res.get("ok", false)):
+		_apply_players(res.get("data", {}))
+
+
+func _apply_players(payload: Dictionary) -> void:
 	var players: Array = payload.get("players", [])
 	online_count = int(payload.get("online", players.size()))
-	if payload.has("items"):
-		world_items_received.emit(payload.get("items", []))
 	var seen := {}
 	for entry in players:
 		if typeof(entry) != TYPE_DICTIONARY:

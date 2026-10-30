@@ -183,3 +183,6 @@ cython_debug/
 # Godot 4+ specific ignores
 .godot/
 /android/
+
+# 资源目录（图片 / 字体等二进制媒体）：不入版本库，母本存工作区根部的独立 /assets 仓库
+/assets/

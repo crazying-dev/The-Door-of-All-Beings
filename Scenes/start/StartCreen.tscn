@@ -1,12 +1,12 @@
-[gd_scene format=4 uid="uid://cgby7xghknab0"]
+﻿[gd_scene format=4 uid="uid://cgby7xghknab0"]
 
 [ext_resource type="Script" uid="uid://ckmx5dd48r565" path="res://code/StartCreen/StartCreen.gd" id="1_1odya"]
-[ext_resource type="FontFile" uid="uid://cnuj13qgsulnj" path="res://font/KNMaiyuan-Regular.ttf" id="2_k3akb"]
+[ext_resource type="FontFile" uid="uid://cnuj13qgsulnj" path="res://assets/font/KNMaiyuan-Regular.ttf" id="2_k3akb"]
 [ext_resource type="Script" uid="uid://crdogypawrbfx" path="res://code/StartCreen/User/userDOM.gd" id="3_ebpa5"]
-[ext_resource type="Texture2D" uid="uid://bjvuhfcn2irew" path="res://icons/UI/-1.png" id="4_t5eaf"]
-[ext_resource type="Texture2D" uid="uid://wx6uq0fhkucg" path="res://icons/UI/button.png" id="5_t2lld"]
+[ext_resource type="Texture2D" uid="uid://bjvuhfcn2irew" path="res://assets/icons/UI/-1.png" id="4_t5eaf"]
+[ext_resource type="Texture2D" uid="uid://wx6uq0fhkucg" path="res://assets/icons/UI/button.png" id="5_t2lld"]
 [ext_resource type="Script" uid="uid://bcry6qg2pi62h" path="res://code/StartCreen/UserLoaded/UserLoaded.gd" id="6_4ulut"]
-[ext_resource type="Texture2D" uid="uid://bcrf0hvv15422" path="res://icons/UI/UserLoaded.png" id="7_7gcx6"]
+[ext_resource type="Texture2D" uid="uid://bcrf0hvv15422" path="res://assets/icons/UI/UserLoaded.png" id="7_7gcx6"]
 
 [sub_resource type="LabelSettings" id="LabelSettings_bhunq"]
 font = ExtResource("2_k3akb")

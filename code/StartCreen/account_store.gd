@@ -1,15 +1,23 @@
 extends RefCounted
 ## 账号 / 设备标识的本地存储层：只负责读写 user:// 下的两个文件，不做任何网络操作。
 ##
-##   user://InstallationUniqueID.bin  设备标识（服务端签发并落库的 UUID 文本）
+##   user://InstallationUniqueID.bin     设备标识（服务端签发的不透明票据文本）
+##   user://InstallationUniqueID.bin.mac 设备标识的完整性校验码（v1.3 防篡改，见下）
 ##   user://load.bin                  账号信息（JSON：UserName / UserID）
 ##   user://race.txt                  本机选定的种族 key（纯文本，默认 human）
 ##   user://player_id.txt             本机玩家 UUID（协议 v1.2：客户端自己生成，注册时交给服务端）
 ##
 ## 单独抽一层的原因：登录流程（userDOM.gd）与确认面板（UserLoaded.gd）都要读它，
 ## 而且旧版本写坏过的内容（例如把 UserID 写成了 null）需要在这里统一兜住。
+##
+## 设备标识防篡改（协议 v1.3 / Req6）：设备 ID 文件旁配一个 .mac 校验文件，
+## 内容是 HMAC-SHA256（密钥 = 本机机器指纹 + 内置盐）对 ID 原文的签名。
+## 读取时先验签：文件被手改 / 从别的机器拷来（机器指纹不同）都会校验失败，
+## 此时按「本地标识被写坏」处理（清掉两份文件、向服务端重领），绝不带着脏值去请求。
 
 const DEVICE_PATH := "user://InstallationUniqueID.bin"
+## 设备标识的完整性校验码文件（v1.3 防篡改）：与 DEVICE_PATH 同基名 + .mac 后缀。
+const DEVICE_MAC_PATH := DEVICE_PATH + ".mac"
 const ACCOUNT_PATH := "user://load.bin"
 ## 种族选择单独存一个小文件：账号文件只认 UserName / UserID，
 ## 混在一起的话任何一次 write_account() 都会把种族洗掉。
@@ -66,19 +74,67 @@ static func remove_file(path: String) -> void:
 
 # ---------------------------------------------------------------- 设备标识
 
+## 内置盐：只用于搅动本地校验密钥，不算机密（本地防篡改的强度上限就是
+## 「拷到别的机器 / 手改文件」这一级）。真正的权威校验在服务端（HMAC 票据）。
+const _DEVICE_MAC_PEPPER := "TDOB-device-v1"
+
+## 本机校验密钥 = 机器指纹 + 盐 的 SHA256。用 OS.get_unique_id() 做机器绑定：
+## 同一份文件拷到别的机器上 MAC 对不上，直接判为篡改。
+static func _device_mac_key() -> PackedByteArray:
+	return sha256_hex(_DEVICE_MAC_PEPPER + "|" + OS.get_unique_id()).hex_decode()
+
+
+## 对设备 ID 原文算 HMAC-SHA256，返回小写 hex。
+static func _device_mac(device_id: String) -> String:
+	var ctx := HMACContext.new()
+	var err := ctx.start(HashingContext.HASH_SHA256, _device_mac_key())
+	if err != OK:
+		push_error("HMAC 初始化失败（错误码 %d），设备标识将按不可用处理" % err)
+		return ""
+	ctx.update(device_id.to_utf8_buffer())
+	return ctx.finish().hex_encode()
+
+
+## 读取设备标识：先验完整性校验码，验不过 = 被篡改 / 拷自别的机器。
+## 返回空串表示「不可用」（不存在 / 校验失败），调用方按无设备去服务端重领。
 static func read_device_id() -> String:
-	return read_text(DEVICE_PATH)
+	var device_id := read_text(DEVICE_PATH)
+	if device_id == "":
+		return ""
+	var stored_mac := read_text(DEVICE_MAC_PATH).to_lower()
+	if stored_mac == "":
+		# 旧版本写的裸文件（没有校验码）：就地补签一次，避免升级把老用户洗成重领。
+		# 注意：这一步等于信任旧内容，只发生在新旧版本交接的第一次读取。
+		if write_device_id(device_id):
+			return device_id
+		return ""
+	var expect := _device_mac(device_id)
+	if expect == "" or not ConstantTime.compare_equal(expect.to_utf8_buffer(), stored_mac.to_utf8_buffer()):
+		push_warning("设备标识完整性校验失败，判定为篡改，已清除本地缓存")
+		clear_device_id()
+		return ""
+	return device_id
 
 
+## 写入设备标识：ID 与校验码两份文件必须都成功才算落盘，写坏就全清掉。
 static func write_device_id(device_id: String) -> bool:
 	device_id = device_id.strip_edges()
 	if device_id == "":
 		return false
-	return write_text(DEVICE_PATH, device_id)
+	var mac := _device_mac(device_id)
+	if mac == "":
+		return false
+	if not write_text(DEVICE_PATH, device_id):
+		return false
+	if not write_text(DEVICE_MAC_PATH, mac):
+		remove_file(DEVICE_PATH)
+		return false
+	return true
 
 
 static func clear_device_id() -> void:
 	remove_file(DEVICE_PATH)
+	remove_file(DEVICE_MAC_PATH)
 
 
 # ---------------------------------------------------------------- 玩家标识

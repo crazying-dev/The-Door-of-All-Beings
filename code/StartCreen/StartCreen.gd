@@ -13,7 +13,7 @@ signal StartLoadUser()
 
 var z = 0 # 计数器-帧数
 const StartAnimationZ = 95
-const StartAnimationFatherPath = "res://icons/TDOB/"
+const StartAnimationFatherPath = "res://assets/icons/TDOB/"
 var StartAnimationList = []
 
 ## 启动动画所需的 95 张 PNG 是否已全部载入完成。

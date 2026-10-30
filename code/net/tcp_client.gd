@@ -1,31 +1,30 @@
 extends Node
-## 众生之门 TCP 协议客户端（协议 v1.2，规范见 server-socket/protocol.md 与 flows.md）。
+## 众生之门 TCP 协议客户端（协议 v1.3，规范见 server-socket/protocol.md 与 flows.md）。
 ##
 ## 职责边界：只负责「把一条请求发出去、把对应的响应拿回来」，不懂业务。
 ## 业务封装在 game_api.gd；地址在 net_config.gd。
 ##
 ## 设计要点：
-##   * **长连接**：一个 TcpClient 只用一条 TCP，登录后同一条连接收 PUSH。
+##   * **长连接**：一个 TcpClient 只用一条 TCP。
+##   * **拉取式（v1.3）**：服务端不再主动推任何帧，世界/在线数据由上层按自选频率拉取。
 ##   * **串行化**：同一时刻只允许一条请求在路上（服务端回帧不带请求 id，
-##     并发就会错配），后来的 call 会排队。
+##     并发就会错配），后来的 call 会排队。批量请求走 request_batch，一次收多帧。
 ##   * **不阻塞主线程**：全部用 await process_frame 轮询，不开线程。
 ##   * **每次请求都带客户端版本**（协议头第 5 字段），符合项目约定。
-##   * **会话 Token（v1.2）**：建连后服务端主动推 `PUSH | token`，本类自动存下，
-##     并把它放进后续每条请求的第 3 行。没收到 token 时退回 v1.1 的 2 段写法，
-##     老服务端照样能用。
+##   * **联合哈希（v1.3）**：请求尾哈希覆盖「请求头 + 正文两行」，改头部即失效。
+##   * **会话 Token（v1.3）**：不再建连推送，改为从首个 hello 响应里取（adopt_token），
+##     本类把它放进后续每条请求的第 3 行。没 token 时退回 v1.1 的 2 段写法。
 
 const AppInfo = preload("res://code/net/app_info.gd")
 
 ## 协议常量（必须与服务端 protocol.py 一致）。
 const MAGIC := "TheDoorOfBings"
-const PROTOCOL_VERSION := "1.2"
+const PROTOCOL_VERSION := "1.3"
 const ENCRYPTION := "none"
 
-## 推送 topic（与 protocol.py 的 TOPIC_* 一致）。
+## 推送 topic（v1.3 服务端不再下发，保留仅为兼容）。
 const TOPIC_TOKEN := "token"
 const TOPIC_RESET_TOKEN := "reset_token"
-## 建连后等 `PUSH | token` 的上限（秒）。超时不算失败，按 v1.1 兼容模式继续。
-const TOKEN_WAIT_SEC := 3.0
 
 ## 单行上限，超过就丢弃缓冲区（服务端默认 16384）。
 const MAX_LINE_BYTES := 16384
@@ -117,8 +116,7 @@ func connect_to(host: String, port: int) -> bool:
 			token_expire = 0
 			reset_rtt()
 			_connecting = false
-			# 先等 token 再宣告「已连接」：监听者一收到 connection_changed 就会发请求
-			await _await_token()
+			# v1.3：建连后服务端不发任何帧；Token 随首个 hello 响应下发（见 game_api）
 			_set_connected(true)
 			return true
 		if status == StreamPeerTCP.STATUS_ERROR or status == StreamPeerTCP.STATUS_NONE:
@@ -191,7 +189,7 @@ func _apply_token(value: String) -> void:
 	token_changed.emit(value)
 
 
-## 从推送帧里吸收 token / reset_token（两帧都是服务端主动发的）。
+## 从推送帧里吸收 token / reset_token（v1.3 服务端已不再推；保留仅为兼容老服务端）。
 func _absorb_push_token(topic: String, payload: Dictionary) -> void:
 	if topic == TOPIC_TOKEN:
 		token_expire = int(payload.get("expire", 0))
@@ -200,16 +198,6 @@ func _absorb_push_token(topic: String, payload: Dictionary) -> void:
 		# 先清掉再告诉监听者：它直接重登就能拿回新值
 		clear_token()
 		token_reset.emit(str(payload.get("reason", "")))
-
-
-## 等建连后服务端主动推的 `PUSH | token`。
-## 超时不算失败：老服务端（v1.1）根本不发，客户端按 2 段报文继续走。
-func _await_token(timeout := TOKEN_WAIT_SEC) -> void:
-	var deadline := Time.get_ticks_msec() + int(timeout * 1000.0)
-	while session_token == "" and Time.get_ticks_msec() < deadline:
-		await get_tree().process_frame
-	if session_token == "":
-		push_warning("未在 %.1f 秒内收到会话 Token，按 v1.1 兼容模式继续" % timeout)
 
 
 # ---------------------------------------------------------------- 收包
@@ -349,24 +337,84 @@ static func _fake_fail(code: String, message: String) -> Dictionary:
 	return {"kind": "FAIL", "ok": false, "action": "", "code": code, "message": message, "data": {}}
 
 
+## 发送一条批量请求（v1.3）：一条报文携带多个动作，服务端按序返回多帧。
+## calls 形如 [["state","1&2&3&4"], ["peers",""]]。返回与 calls 等长的响应数组
+## （若服务端因报文级错误只回了一帧，末尾会以 TIMEOUT 伪响应补齐）。
+func request_batch(calls: Array, device_hex := "", user_id := "") -> Array:
+	while _busy:
+		await get_tree().process_frame
+	_busy = true
+	var res := await _request_batch_once(calls, device_hex, user_id)
+	_busy = false
+	return res
+
+
+func _request_batch_once(calls: Array, device_hex: String, user_id: String) -> Array:
+	var n := calls.size()
+	if not is_connected_to_server():
+		return _fill_fails(n, "DISCONNECTED", "未连接到服务器")
+
+	_inbox.clear()
+	var sent_usec := Time.get_ticks_usec()
+	var packet := build_packet("", "", device_hex, user_id, calls)
+	var err := _peer.put_data(packet)
+	if err != OK:
+		return _fill_fails(n, "NETWORK_ERROR", "发送失败（错误码 %d）" % err)
+
+	var deadline := Time.get_ticks_msec() + int(timeout_sec * 1000.0)
+	var out: Array = []
+	while out.size() < n and Time.get_ticks_msec() < deadline:
+		while not _inbox.is_empty() and out.size() < n:
+			out.append(_inbox.pop_front())
+		if out.size() >= n:
+			break
+		if not is_connected_to_server():
+			break
+		await get_tree().process_frame
+	if out.size() == n:
+		_record_rtt(sent_usec)
+	else:
+		# 报文级错误（如 token 失效）会让服务端只回一帧：把缺的都补成 TIMEOUT
+		while out.size() < n:
+			out.append(_fake_fail("TIMEOUT", "批量响应不足（服务端可能只回了一帧）"))
+	return out
+
+
+static func _fill_fails(n: int, code: String, message: String) -> Array:
+	var arr: Array = []
+	for _i in n:
+		arr.append(_fake_fail(code, message))
+	return arr
+
+
 # ---------------------------------------------------------------- 组包
 
-## 按协议 v1.2 拼一条 4 行报文。
-## 哈希必须对「第 2 行原文 + \n + 第 3 行原文」逐字节计算，不要 strip。
+## 按协议 v1.3 拼一条 4 行报文。
+## 联合哈希对「第 1 行原文 + \n + 第 2 行原文 + \n + 第 3 行原文」逐字节计算，不要 strip。
 ## 第 3 行带 token 时是 3 段（`<token> | <device> | <user>`），
 ## 没 token 时退回 v1.1 的 2 段（`<device> | <user>`），服务端两种都认。
-func build_packet(action: String, action_data: String, device_hex: String, user_id: String) -> PackedByteArray:
+## 传了 calls（[[a,d],…]）时第 2 行为批量格式 `a1|d1;;a2|d2`。
+func build_packet(action: String, action_data: String, device_hex: String, user_id: String, calls: Array = []) -> PackedByteArray:
 	var ts := int(Time.get_unix_time_from_system())
 	var head := "%s | %s | %d | %s | %s | %s | %s" % [
 		MAGIC, PROTOCOL_VERSION, ts, ENCRYPTION,
 		_client_version, _platform, _locale,
 	]
-	var body1 := "%s | %s" % [action, action_data]
+	var body1 := _join_batch(calls) if not calls.is_empty() else "%s | %s" % [action, action_data]
 	var body2 := "%s | %s" % [device_hex, user_id]
 	if session_token != "":
 		body2 = "%s | %s | %s" % [session_token, device_hex, user_id]
-	var digest := sha256_hex(body1 + "\n" + body2)
+	# v1.3 联合哈希：覆盖「请求头 + 正文两行」
+	var digest := sha256_hex(head + "\n" + body1 + "\n" + body2)
 	return (head + "\n" + body1 + "\n" + body2 + "\n" + digest + " | " + digest + "\n").to_utf8_buffer()
+
+
+## 把 [[a1,d1],[a2,d2],…] 拼成第 2 行的批量正文 `a1 | d1;;a2 | d2`。
+static func _join_batch(calls: Array) -> String:
+	var parts: PackedStringArray = []
+	for c in calls:
+		parts.append("%s | %s" % [c[0], c[1]])
+	return ";;".join(parts)
 
 
 static func sha256_hex(text: String) -> String:

@@ -1,12 +1,13 @@
 extends Node
 ## 业务层：把协议动作包成 GDScript 方法，并维护「本机设备 / 当前账号」状态。
 ##
-## 协议 v1.2（规范见 server-socket/protocol.md 与 flows.md）：
-##   * 一条 TCP 长连接，登录后同一条连接会持续收到 PUSH world；
+## 协议 v1.3（规范见 server-socket/protocol.md 与 flows.md）：
+##   * 一条 TCP 长连接，服务端**不再主动推送**：世界/在线数据由 net_sync 按自选频率拉取；
 ##   * 设备标识由**服务端签发**（客户端不持密钥），拿到后原样存在本地；
 ##   * user_id 由**服务端生成**，注册提交 `<user_name>&<race>&<player_id>`；
-##   * player_id 是**本机生成的 UUID**（协议 v1.2），服务端另存一份做本地标识；
-##   * 会话 Token 由 TcpClient 自动维护，本层只管 token 失效后的重登。
+##   * player_id 是**本机生成的 UUID**，服务端另存一份做本地标识；
+##   * 会话 Token 随首个 hello 响应下发，本层采纳后交给 TcpClient 自动携带；
+##   * Token 失效（SESSION_TOKEN_EXPIRED）由 _call 统一重登重试。
 
 const TcpClient = preload("res://code/net/tcp_client.gd")
 const NetConfig = preload("res://code/net/net_config.gd")
@@ -49,7 +50,8 @@ var world_rev := 0
 ## hello 拿到的服务端信息。
 var server_version := ""
 var protocol_version := ""
-var push_hz := 10.0
+## v1.3：服务端不再主动推送，固定 0；仅用于展示。
+var push_hz := 0.0
 var user_name_max_len := AccountStore.USER_NAME_MAX_LEN
 
 ## 最近一次失败的友好说明（给 UI 用）。
@@ -93,8 +95,10 @@ func connect_and_hello() -> bool:
 	var data: Dictionary = res.get("data", {})
 	server_version = str(data.get("server_version", ""))
 	protocol_version = str(data.get("protocol_version", ""))
-	push_hz = float(data.get("push_hz", 10))
+	push_hz = float(data.get("push_hz", 0))
 	user_name_max_len = int(data.get("user_name_max_len", user_name_max_len))
+	# v1.3：会话 Token 随首个 hello 响应下发，存下后后续请求自动携带
+	_adopt_session_token(data)
 	return true
 
 
