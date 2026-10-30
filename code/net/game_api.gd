@@ -61,6 +61,11 @@ var user_name_max_len := AccountStore.USER_NAME_MAX_LEN
 var endpoint_host := ""
 var endpoint_port := 0
 
+## 登录响应带回的「上次退出位置」（服务器存档坐标）；net_sync 进世界时据此把本机玩家放到原位。
+var spawn_position := Vector3.ZERO
+var spawn_yaw := 0.0
+var has_spawn := false
+
 ## 最近一次失败的友好说明（给 UI 用）。
 var last_error := ""
 
@@ -202,6 +207,7 @@ func login(login_user_id: String) -> Dictionary:
 	if bool(res.get("ok", false)):
 		var data: Dictionary = res.get("data", {})
 		_mark_authenticated(str(data.get("user_id", login_user_id)), str(data.get("user_name", "")))
+		_apply_spawn(data)
 	return res
 
 
@@ -308,6 +314,21 @@ func _remember_player(data: Dictionary) -> void:
 		player_name = str(data.get("player_name", "")).strip_edges()
 	if data.has("race"):
 		race = str(data.get("race", "")).strip_edges()
+
+
+## 从 login 响应里读回自身存档坐标（服务端 v1.3 已回写 pos_x/y/z + yaw）。
+## 旧服务端不带这些字段时 has_spawn=false，客户端保持场景默认出生点。
+func _apply_spawn(data: Dictionary) -> void:
+	if not data.has("pos_x"):
+		has_spawn = false
+		return
+	spawn_position = Vector3(
+		float(data.get("pos_x", 0.0)),
+		float(data.get("pos_y", 0.0)),
+		float(data.get("pos_z", 0.0)),
+	)
+	spawn_yaw = float(data.get("yaw", 0.0))
+	has_spawn = true
 
 
 func whoami() -> Dictionary:

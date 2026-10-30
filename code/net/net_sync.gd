@@ -93,7 +93,20 @@ func _bootstrap() -> void:
 	if not await _login_now():
 		push_warning("联机同步未登录：%s" % str(_api.last_error))
 		return
+	# 先按服务器存档把本机玩家放到「上次退出位置」，再开主循环上报；
+	# 顺序不能反，否则第一帧 state 会用场景默认点覆盖掉存档位置。
+	_apply_spawn_to_player()
 	await _after_login()
+
+
+## 进世界首帧把本机玩家放到服务器存档的「上次退出位置」。仅初次进入调用；
+## 断线重连不走这里（人已在地里，瞬移反而突兀）。无存档 / 旧服务端则保持场景默认点。
+func _apply_spawn_to_player() -> void:
+	if _player == null or _api == null or not bool(_api.has_spawn):
+		return
+	if not _player.has_method("teleport_to_point"):
+		return
+	_player.call("teleport_to_point", _api.spawn_position, float(_api.spawn_yaw))
 
 
 ## 静默重登（建连 + hello + device + login）。成功返回 true。
