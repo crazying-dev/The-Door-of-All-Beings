@@ -121,6 +121,17 @@ static func _device_mac(device_id: String) -> String:
 	return ctx.finish().hex_encode()
 
 
+## 恒定时间字符串比较：不用引擎类（ConstantTime 在部分 4.x 版本不存在），
+## 自己逐字节累积差异，中途不短路，避免时序侧信道。
+static func _const_equal(a: String, b: String) -> bool:
+	if a.length() != b.length():
+		return false
+	var diff := 0
+	for i in a.length():
+		diff |= a.substr(i, 1).to_utf8_buffer()[0] ^ b.substr(i, 1).to_utf8_buffer()[0]
+	return diff == 0
+
+
 ## 读取设备标识：先验完整性校验码，验不过 = 被篡改 / 拷自别的机器。
 ## 返回空串表示「不可用」（不存在 / 校验失败），调用方按无设备去服务端重领。
 static func read_device_id() -> String:
@@ -135,7 +146,7 @@ static func read_device_id() -> String:
 			return device_id
 		return ""
 	var expect := _device_mac(device_id)
-	if expect == "" or not ConstantTime.compare_equal(expect.to_utf8_buffer(), stored_mac.to_utf8_buffer()):
+	if expect == "" or not _const_equal(expect, stored_mac):
 		push_warning("设备标识完整性校验失败，判定为篡改，已清除本地缓存")
 		clear_device_id()
 		return ""
