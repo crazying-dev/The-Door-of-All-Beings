@@ -13,6 +13,9 @@ const TcpClient = preload("res://code/net/tcp_client.gd")
 const NetConfig = preload("res://code/net/net_config.gd")
 const AccountStore = preload("res://code/StartCreen/account_store.gd")
 
+## HTTP 发现请求超时（秒）。
+const DISCOVER_TIMEOUT := 6.0
+
 ## 服务端推送的世界快照（10Hz）。
 signal world_pushed(payload: Dictionary)
 ## 服务端推送的玩家上下线事件。
@@ -54,6 +57,10 @@ var protocol_version := ""
 var push_hz := 0.0
 var user_name_max_len := AccountStore.USER_NAME_MAX_LEN
 
+## 发现接口（机器A）解析出的 TCP 游戏服地址（机器B）；连上后记录，供展示/重连。
+var endpoint_host := ""
+var endpoint_port := 0
+
 ## 最近一次失败的友好说明（给 UI 用）。
 var last_error := ""
 
@@ -79,12 +86,28 @@ func is_connected_to_server() -> bool:
 # ---------------------------------------------------------------- 握手
 
 ## 建连 + hello。失败时 last_error 有原因。
+## 先向 HTTP 发现服务（机器A）问到 TCP 游戏服地址（机器B）再连；发现失败时回退直连默认值。
 func connect_and_hello() -> bool:
 	last_error = ""
-	var host := NetConfig.host()
-	var port := NetConfig.port()
+	var host := ""
+	var port := 0
+	var disc := await _discover_tcp_endpoint()
+	if bool(disc.get("ok", false)):
+		host = str(disc.get("host", ""))
+		port = int(disc.get("port", 0))
+		endpoint_host = host
+		endpoint_port = port
+		print("发现接口解析到 TCP 游戏服 %s:%d" % [host, port])
+	else:
+		push_warning("发现接口不可用（%s），回退直连默认地址" % str(disc.get("error", "")))
+		host = NetConfig.host()
+		port = NetConfig.port()
+	if host == "" or port <= 0:
+		last_error = "没有可用的服务器地址"
+		return false
+
 	if not await _tcp.connect_to(host, port):
-		last_error = "无法连接服务器 %s" % NetConfig.describe()
+		last_error = "无法连接服务器 %s:%d" % [host, port]
 		return false
 
 	var res: Dictionary = await _call("hello")
@@ -196,6 +219,61 @@ func _login_no_retry(login_user_id: String, device: String) -> Dictionary:
 		_remember_player(data)
 		_adopt_session_token(data)
 	return res
+
+
+## HTTP 发现：GET NetConfig.endpoint_url()（机器A），解析出 TCP 游戏服地址（机器B）。
+## 成功 {ok:true, host, port, ...}；失败 {ok:false, error}。发现只走 HTTP，不参与后续 TCP 报文。
+func _discover_tcp_endpoint() -> Dictionary:
+	var url := NetConfig.endpoint_url()
+	var req := HTTPRequest.new()
+	req.timeout = DISCOVER_TIMEOUT
+	add_child(req)
+	# request_completed 有多个参数；await 信号只能拿到首个，故用一次性 lambda 捕获全部。
+	var captured := {"done": false, "result": -1, "code": 0, "body": PackedByteArray()}
+	req.request_completed.connect(func(result, code, _headers, body):
+		captured["done"] = true
+		captured["result"] = result
+		captured["code"] = code
+		captured["body"] = body
+	, CONNECT_ONE_SHOT)
+	var err := req.request(url, [], HTTPClient.METHOD_GET)
+	if err != OK:
+		req.queue_free()
+		return {"ok": false, "error": "发起发现请求失败（%d）" % err}
+	# 帧轮询等待完成信号（lambda 已捕获参数），带超时兵底。
+	var deadline_ms := Time.get_ticks_msec() + int((DISCOVER_TIMEOUT + 2.0) * 1000.0)
+	while not bool(captured["done"]) and is_instance_valid(req) and Time.get_ticks_msec() < deadline_ms:
+		await get_tree().process_frame
+	var done := bool(captured["done"])
+	if is_instance_valid(req):
+		req.queue_free()
+	if not done:
+		return {"ok": false, "error": "发现请求超时"}
+	if int(captured["result"]) != HTTPRequest.RESULT_SUCCESS:
+		return {"ok": false, "error": "发现请求失败（结果码 %d）" % int(captured["result"])}
+	var code := int(captured["code"])
+	if code != 200:
+		return {"ok": false, "error": "发现接口返回 HTTP %d" % code}
+	var parsed: Variant = JSON.parse_string((captured["body"] as PackedByteArray).get_string_from_utf8())
+	if typeof(parsed) != TYPE_DICTIONARY:
+		return {"ok": false, "error": "发现响应不是合法 JSON"}
+	var data: Dictionary = parsed
+	var host := ""
+	var port := 0
+	var tcp: Variant = data.get("tcp", null)
+	if typeof(tcp) == TYPE_DICTIONARY:
+		host = str(tcp.get("host", "")).strip_edges()
+		port = int(tcp.get("port", 0))
+	if host == "":
+		host = str(data.get("host", "")).strip_edges()
+		port = int(data.get("port", 0))
+	if host == "" or port <= 0:
+		return {"ok": false, "error": "发现响应缺少合法的 tcp host/port"}
+	return {
+		"ok": true, "host": host, "port": port,
+		"service_version": str(data.get("service_version", "")),
+		"protocol_version": str(data.get("protocol_version", "")),
+	}
 
 
 ## 响应里回显的 `session_token` 存一份（reset 后靠它取回可用值）。
