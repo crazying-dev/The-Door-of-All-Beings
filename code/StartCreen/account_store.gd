@@ -81,15 +81,19 @@ const _DEVICE_MAC_PEPPER := "TDOB-device-v1"
 ## 本机校验密钥 = 机器指纹 + 盐 的 SHA256。Godot 4 没有跨平台的 OS.get_unique_id()，
 ## 改用稳定的机器属性组合（计算机名 / 用户名 / 系统名 / 架构 / CPU 核数）：
 ## 同一份文件拷到别的机器上指纹不同，MAC 对不上，直接判为篡改。
+## 注意：本文件是 RefCounted 静态工具类，没有 autoload 单例成员；
+## get_architecture() 是 OS 单例（实例）方法而非类静态方法，要走 Engine.get_singleton()。
 static func _machine_fingerprint() -> String:
 	var env := OS.get_environment("COMPUTERNAME")
 	if env == "":
 		env = OS.get_environment("HOSTNAME")
+	var os_singleton: Object = Engine.get_singleton(&"OS")
+	var arch := "" if os_singleton == null else str(os_singleton.call("get_architecture"))
 	return "%s|%s|%s|%s|%d" % [
 		env,
 		OS.get_environment("USERNAME"),
 		OS.get_name(),
-		OS.get_architecture(),
+		arch,
 		OS.get_processor_count(),
 	]
 
