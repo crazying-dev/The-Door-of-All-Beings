@@ -34,7 +34,10 @@ func _place_at_spawn() -> void:
 	# world_map 是 inner_world.gd 的自定义属性，静态类型 Node3D 上不存，故用 Object.get 取。
 	var wm = _inner_world.get("world_map")
 	if wm != null and wm.has_method("ground_y_at_global"):
-		ground_y = float(wm.call("ground_y_at_global", center))
+		var probed := float(wm.call("ground_y_at_global", center))
+		# 孔洞格会返回 NaN（掉出去交给掉落保护），落点计算不能拿去用，必须过滤。
+		if is_finite(probed):
+			ground_y = probed
 	# 出生点平台顶面约 0.2m，再抬 1.5m 让人物从上方自落到平台上。
 	var point := Vector3(center.x, ground_y + 1.5, center.z)
 	_player.teleport_to_point(point, randf() * 360.0)

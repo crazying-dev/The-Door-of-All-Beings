@@ -7,11 +7,12 @@ extends Node3D
 ##   * 出生点平台用一个小 BoxShape3D 碰撞；
 ##   * 两个模型都挂在本节点（MapRoot）下，共用同一个 world_scale —— 满足「原点叠合、放大需同倍数」约束。
 ##
-## 坐标约定：本节点的局部坐标 = obj 顶点坐标（Godot 的 OBJ 导入已把 Z-up 转成 Y-up，
-## 网格顶点即世界空间里的 y 高度）。视觉网格与碰撞都直接建在这套局部坐标上，天然对齐。
+## 坐标约定：本节点的局部坐标 = obj 顶点坐标（模型已确认 Y-up：200(X) x 98.5(Y高) x 200(Z)，
+## 底面 y=0）。视觉网格与碰撞都直接建在这套局部坐标上，天然对齐。
 ##
-## 导入产物兼容：load(".obj") 一般返回 PackedScene（内含一个 MeshInstance3D）；
-## 少数配置下可能直接是 Mesh。两种都处理；拿不到就整体跳过（未导入前也不报错）。
+## 导入产物兼容：本项目的 .obj 导入模式产出的直接是 Mesh（见 map_v1.obj.import type="Mesh"）；
+## 兼容 PackedScene 产物时取全部 MeshInstance3D（导入器按材质/平滑组可能拆成多个，只取
+## 第一个会漏掉整块地图）。拿不到就整体跳过（未导入前也不报错）。
 
 ## 地图 / 出生点模型路径（英文目录，避免 res:// 含非 ASCII）。
 const MAP_PATH := "res://assets/models/map_v1.obj"
@@ -23,9 +24,10 @@ const SPAWN_PATH := "res://assets/models/map_v1_spawn.obj"
 ## 若想改粗细只改 map 分辨率（max_grid_side），不要改这个值，否则碰撞会与视觉错位。
 const SAMPLE_SPACING := 1.0
 ## 栅格单边最大格数（防御性上限，避免异常大的包围盒把内存吃爆）。
-@export var max_grid_side: int = 400
+## 200m 地图需要 401 格，旧值 400 会静默截断最后一列并错位其余顶点。
+@export var max_grid_side: int = 512
 
-## 地图是否加载成功（inner_world / world 据此决定是否移除占位地板、把出生点抬到地面）。
+## 地图是否加载成功（inner_world / 各场景据此决定是否移除占位地板、把出生点抬到地面）。
 var loaded: bool = false
 
 ## 高度图缓存（供 height_at 查询）。
@@ -43,20 +45,24 @@ func _ready() -> void:
 		load_spawn_platform()
 
 
-## 返回地图网格在 MapRoot 局部空间的高度（米）；未加载/越界则回落到 base（0）。
+## 返回地图网格在 MapRoot 局部空间的高度（米）；未加载返回 0。
+## 越界用最近边缘格；无任何三角形覆盖的孔洞格返回 NaN（人会从这里掉下去，
+## 由 FALL_LIMIT 掉落保护接住送回出生点 —— 比伪造一块贴地的隐形地板更真实）。
 func height_at(local_x: float, local_z: float) -> float:
 	if not loaded or _grid_w <= 0 or _grid_d <= 0:
 		return 0.0
-	# 越界用最近边缘格（地形边缘外也是地面，别把人物抛到 0 以下）。
 	var i := clampi(int(round((local_x - _min_x) / SAMPLE_SPACING)), 0, _grid_w - 1)
 	var j := clampi(int(round((local_z - _min_z) / SAMPLE_SPACING)), 0, _grid_d - 1)
 	return _heights[i * _grid_d + j]
 
 
-## 给定世界坐标，返回其正下方的地面高度（世界 Y）。给 _arrive() 摆放出生点用。
+## 给定世界坐标，返回其正下方的地面高度（世界 Y）。给摆放出生点 / 复位用。
+## 孔洞格（NaN）原样传出去，调用方用 is_finite 判断后回落。
 func ground_y_at_global(global_pos: Vector3) -> float:
 	var local := to_local(global_pos)
 	var h := height_at(local.x, local.z)
+	if is_nan(h):
+		return h
 	# 把局部高度换算回世界 Y（含 MapRoot 的 scale / 位移）。
 	return to_global(Vector3(local.x, h, local.z)).y
 
@@ -65,7 +71,7 @@ func ground_y_at_global(global_pos: Vector3) -> float:
 func _load_map() -> bool:
 	var mesh := _extract_mesh(MAP_PATH)
 	if mesh == null:
-		push_warning("门内地图未就绪（%s 尚未导入或不是 ArrayMesh），已跳过。" % MAP_PATH)
+		push_warning("门内地图未就绪（%s 尚未导入），已跳过。" % MAP_PATH)
 		return false
 
 	# 视觉：直接用一个 MeshInstance3D 承载网格（identity 变换，坐标即顶点坐标）。
@@ -73,6 +79,7 @@ func _load_map() -> bool:
 	visual.name = "MapVisual"
 	visual.mesh = mesh
 	add_child(visual)
+	_ensure_material(mesh, visual)
 
 	# 碰撞：扫描顶点建高度图栅格。
 	if not _build_height_collision(mesh):
@@ -80,51 +87,85 @@ func _load_map() -> bool:
 	return true
 
 
+## obj 没带材质（MTL 空文件 / 无 usemtl）时给一个中性灰材质兜底，
+## 避免出现无材质表面在不同渲染后端下表现不一致（部分区域发黑或不显示）。
+## 只补没有材质的表面，已经带材质的不动。
+func _ensure_material(mesh: Mesh, visual: MeshInstance3D) -> void:
+	var any_material := false
+	for s in mesh.get_surface_count():
+		if mesh.surface_get_material(s) != null:
+			any_material = true
+			break
+	if any_material:
+		return
+	var mat := StandardMaterial3D.new()
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.albedo_color = Color(0.5, 0.52, 0.55)
+	# material_override 对全部表面生效，也不用担心表面数量。
+	visual.material_override = mat
+
+
 ## 从 mesh 顶点建 HeightMapShape3D 并挂 StaticBody3D。成功返回 true。
-func _build_height_collision(mesh: ArrayMesh) -> bool:
-	var arrays: Array = mesh.surface_get_arrays(0)
-	if arrays == null or arrays.size() <= Mesh.ARRAY_VERTEX:
-		push_warning("地图表面数据缺少顶点数组，跳过碰撞。")
-		return false
-	var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
-	if verts.size() == 0:
+## 扫全部表面：导入器按材质 / 平滑组拆分时只读 0 号表面会丢一大块碰撞。
+func _build_height_collision(mesh: Mesh) -> bool:
+	var surface_count := mesh.get_surface_count()
+	if surface_count == 0:
 		return false
 
-	# 第一遍：求 X/Z 包围与最低 y（作为未覆盖格子的兜底高度）。
+	# 顶点数组只取一次缓存住：surface_get_arrays 对压缩网格是解压操作，
+	# 百万顶点的 mesh 重复取两遍会明显拖慢进场。
+	var surfaces: Array[PackedVector3Array] = []
+	for s in surface_count:
+		surfaces.append(_surface_vertices(mesh, s))
+
+	# 第一遍：跨表面求 X/Z 包围。
 	_min_x = INF
 	_min_z = INF
 	var max_x := -INF
 	var max_z := -INF
-	var base_y := INF
-	for v in verts:
-		if v.x < _min_x: _min_x = v.x
-		if v.x > max_x: max_x = v.x
-		if v.z < _min_z: _min_z = v.z
-		if v.z > max_z: max_z = v.z
-		if v.y < base_y: base_y = v.y
-	if not is_finite(_min_x) or not is_finite(max_x):
+	var total_verts := 0
+	for verts in surfaces:
+		if verts == null:
+			continue
+		total_verts += verts.size()
+		for v in verts:
+			if v.x < _min_x: _min_x = v.x
+			if v.x > max_x: max_x = v.x
+			if v.z < _min_z: _min_z = v.z
+			if v.z > max_z: max_z = v.z
+	if total_verts == 0 or not is_finite(_min_x) or not is_finite(max_x):
+		push_warning("地图表面数据缺少顶点数组，跳过碰撞。")
 		return false
 
 	_grid_w = clampi(int(round((max_x - _min_x) / SAMPLE_SPACING)) + 1, 1, max_grid_side)
 	_grid_d = clampi(int(round((max_z - _min_z) / SAMPLE_SPACING)) + 1, 1, max_grid_side)
 
-	# 初始化为 base_y（地形以下就是这块底），命中处取最高 y（heightfield 单值，取顶）。
+	# 初始化为 NaN（= 无覆盖孔洞，让人掉下去），命中处取最高 y（heightfield 单值，取顶）。
+	var cell_count := _grid_w * _grid_d
 	_heights = PackedFloat32Array()
-	_heights.resize(_grid_w * _grid_d)
-	for k in _heights.size():
-		_heights[k] = base_y
+	_heights.resize(cell_count)
+	for k in cell_count:
+		_heights[k] = NAN
 	var hit := PackedByteArray()
-	hit.resize(_grid_w * _grid_d)
-	for v in verts:
-		var i := int(round((v.x - _min_x) / SAMPLE_SPACING))
-		var j := int(round((v.z - _min_z) / SAMPLE_SPACING))
-		if i < 0 or i >= _grid_w or j < 0 or j >= _grid_d:
+	hit.resize(cell_count)
+	for verts in surfaces:
+		if verts == null:
 			continue
-		var idx := i * _grid_d + j
-		if v.y > _heights[idx]:
-			_heights[idx] = v.y
-		hit[idx] = 1
+		for v in verts:
+			var i := int(round((v.x - _min_x) / SAMPLE_SPACING))
+			var j := int(round((v.z - _min_z) / SAMPLE_SPACING))
+			if i < 0 or i >= _grid_w or j < 0 or j >= _grid_d:
+				continue
+			var idx := i * _grid_d + j
+			if hit[idx] == 0 or v.y > _heights[idx]:
+				_heights[idx] = v.y
+			hit[idx] = 1
 	_fill_gaps(hit)
+	# 扩散 8 轮仍未覆盖的格子保持「洞」：压成 -100（远低于 FALL_LIMIT=-40），
+	# 玩家踩上去会掉出去被掉落保护送回出生点，而不是被一块隐形地板托住。
+	for k in cell_count:
+		if hit[k] == 0:
+			_heights[k] = -100.0
 
 	var shape := HeightMapShape3D.new()
 	shape.map_width = _grid_w
@@ -151,7 +192,22 @@ func _build_height_collision(mesh: ArrayMesh) -> bool:
 	return true
 
 
-## 把没被顶点命中的格子用邻域平均补上，避免内部小空洞把人物抛到底。
+## 取某表面的顶点数组；不支持 ArrayMesh 语义的网格（压缩格式等）返回 null。
+func _surface_vertices(mesh: Mesh, surface: int) -> PackedVector3Array:
+	var array_mesh := mesh as ArrayMesh
+	if array_mesh == null:
+		return null
+	var arrays: Array = array_mesh.surface_get_arrays(surface)
+	if arrays == null or arrays.size() <= Mesh.ARRAY_VERTEX:
+		return null
+	var verts: PackedVector3Array = arrays[Mesh.ARRAY_VERTEX]
+	if verts.size() == 0:
+		return null
+	return verts
+
+
+## 把没被顶点命中的格子用邻域平均补上，避免地形内部小空洞把人物抛下去。
+## 补不到的（地形以外的空格）保持「洞」，见 _build_height_collision 末尾。
 func _fill_gaps(hit: PackedByteArray) -> void:
 	var has_gap := false
 	for k in hit.size():
@@ -160,7 +216,7 @@ func _fill_gaps(hit: PackedByteArray) -> void:
 			break
 	if not has_gap:
 		return
-	# 有限次扩散填充（边缘外的空格保持 base_y 不动）。
+	# 有限次扩散填充（只从有邻居的格子向外蔓延，一次 8 轮足够盖住格网毛刺）。
 	for _pass in 8:
 		var changed := false
 		for i in _grid_w:
@@ -200,6 +256,7 @@ func load_spawn_platform() -> void:
 	visual.name = "SpawnVisual"
 	visual.mesh = mesh
 	add_child(visual)
+	_ensure_material(mesh, visual)
 
 	var aabb := mesh.get_aabb()
 	var body := StaticBody3D.new()
@@ -216,33 +273,38 @@ func load_spawn_platform() -> void:
 	add_child(body)
 
 
-## 从 .obj 路径取 ArrayMesh：兼容「导入成 PackedScene」与「直接是 Mesh」两种产物。
-func _extract_mesh(path: String) -> ArrayMesh:
+## 从 .obj 路径取 Mesh：兼容「导入成 Mesh」（本项目 .import 的 type="Mesh"）与
+## 「导入成 PackedScene」两种产物。PackedScene 产物取全部 MeshInstance3D 合并 ——
+## 导入器可能按材质 / 平滑组拆成多个节点，只取第一个会漏掉地图。
+func _extract_mesh(path: String) -> Mesh:
 	var res: Resource = load(path)
 	if res == null:
 		return null
-	var mesh: Mesh = null
+	if res is Mesh:
+		return res as Mesh
 	if res is PackedScene:
 		var inst := (res as PackedScene).instantiate()
-		mesh = _find_first_mesh(inst)
+		var meshes := []
+		_collect_meshes(inst, meshes)
 		inst.free()
-	elif res is Mesh:
-		mesh = res as Mesh
-	if mesh is ArrayMesh:
-		return mesh as ArrayMesh
-	if mesh != null:
-		push_warning("%s 不是 ArrayMesh（%s），无法读取顶点建碰撞。" % [path, mesh.get_class()])
+		if meshes.size() == 1:
+			return meshes[0]
+		if meshes.size() > 1:
+			var combined := ArrayMesh.new()
+			for m in meshes:
+				combined.append_surface_from_arrays(
+					m.get_primitive_type(), m.surface_get_arrays(0),
+					m.surface_get_material(0))
+			return combined
+	push_warning("%s 不是可识别的 Mesh 导入产物，已跳过。" % path)
 	return null
 
 
-## 递归找第一个带 mesh 的 MeshInstance3D。
-func _find_first_mesh(node: Node) -> Mesh:
+## 递归收集节点树里所有带 mesh 的 MeshInstance3D。
+func _collect_meshes(node: Node, out: Array) -> void:
 	if node is MeshInstance3D:
 		var mi := node as MeshInstance3D
 		if mi.mesh != null:
-			return mi.mesh
+			out.append(mi.mesh)
 	for child in node.get_children():
-		var found := _find_first_mesh(child)
-		if found != null:
-			return found
-	return null
+		_collect_meshes(child, out)
