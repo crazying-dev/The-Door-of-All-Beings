@@ -114,7 +114,8 @@ func _build_height_collision(mesh: Mesh) -> bool:
 
 	# 顶点数组只取一次缓存住：surface_get_arrays 对压缩网格是解压操作，
 	# 百万顶点的 mesh 重复取两遍会明显拖慢进场。
-	var surfaces: Array[PackedVector3Array] = []
+	# 故意不写类型标注：取不到顶点的表面存 null（PackedVector3Array 装不了 null）。
+	var surfaces := []
 	for s in surface_count:
 		surfaces.append(_surface_vertices(mesh, s))
 
@@ -193,7 +194,8 @@ func _build_height_collision(mesh: Mesh) -> bool:
 
 
 ## 取某表面的顶点数组；不支持 ArrayMesh 语义的网格（压缩格式等）返回 null。
-func _surface_vertices(mesh: Mesh, surface: int) -> PackedVector3Array:
+## 故意不写返回类型标注：GDScript 不允许在 PackedVector3Array 返回类型下 return null。
+func _surface_vertices(mesh: Mesh, surface: int):
 	var array_mesh := mesh as ArrayMesh
 	if array_mesh == null:
 		return null
