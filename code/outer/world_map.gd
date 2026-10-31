@@ -18,8 +18,9 @@ extends Node3D
 const MAP_PATH := "res://assets/models/map_v1.obj"
 const SPAWN_PATH := "res://assets/models/map_v1_spawn.obj"
 
-## 地图与出生点共用的整体缩放。1 单位 = 1 米时 200m x 200m，默认 1.0。
-@export var world_scale: float = 1.0
+## 地图与出生点共用的整体缩放。1 单位 = 1 米时 200m x 200m；按需求整体放大一倍
+## （高度图碰撞建在局部坐标上随节点一起缩放，改这个值视觉/碰撞不会错位）。
+@export var world_scale: float = 2.0
 ## 高度图采样间距（米）。Godot 的 HeightMapShape3D 采样间距固定 1m，此处与之绑死；
 ## 若想改粗细只改 map 分辨率（max_grid_side），不要改这个值，否则碰撞会与视觉错位。
 const SAMPLE_SPACING := 1.0
@@ -137,6 +138,11 @@ func _build_height_collision(mesh: Mesh) -> bool:
 	if total_verts == 0 or not is_finite(_min_x) or not is_finite(max_x):
 		push_warning("地图表面数据缺少顶点数组，跳过碰撞。")
 		return false
+
+	# 诊断日志：源 obj 是 1,000,000 顶点 / 998,001 四边面，如果这里明显少一截，
+	# 说明导入产物本身不全（重导入 / 换 Blender 导出设置解决），而不是运行时代码的问题。
+	print("[world_map] 导入表面数=%d 顶点总数=%d XZ包围=(%.1f, %.1f)~(%.1f, %.1f)" % [
+		surface_count, total_verts, _min_x, _min_z, max_x, max_z])
 
 	_grid_w = clampi(int(round((max_x - _min_x) / SAMPLE_SPACING)) + 1, 1, max_grid_side)
 	_grid_d = clampi(int(round((max_z - _min_z) / SAMPLE_SPACING)) + 1, 1, max_grid_side)

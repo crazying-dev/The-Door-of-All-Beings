@@ -1,0 +1,40 @@
+[gd_scene load_steps=6 format=3]
+
+[ext_resource type="Mesh" path="res://assets/models/map_v1.obj" id="1_map"]
+[ext_resource type="Mesh" path="res://assets/models/map_v1_spawn.obj" id="2_spawn"]
+
+[sub_resource type="ProceduralSkyMaterial" id="SkyMat_test"]
+sky_top_color = Color(0.52, 0.62, 0.78, 1)
+sky_horizon_color = Color(0.62, 0.72, 0.88, 1)
+ground_bottom_color = Color(0.2, 0.22, 0.26, 1)
+ground_horizon_color = Color(0.62, 0.72, 0.88, 1)
+
+[sub_resource type="Sky" id="Sky_test"]
+sky_material = SubResource("SkyMat_test")
+
+[sub_resource type="Environment" id="Env_test"]
+background_mode = 2
+sky = SubResource("Sky_test")
+tonemap_mode = 2
+glow_enabled = true
+
+[node name="ModelTest" type="Node3D"]
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("Env_test")
+
+[node name="SunLight" type="DirectionalLight3D" parent="."]
+rotation_degrees = Vector3(-55, -120, 0)
+light_energy = 1.1
+shadow_enabled = true
+
+[node name="MapVisual" type="MeshInstance3D" parent="."]
+mesh = ExtResource("1_map")
+
+[node name="SpawnVisual" type="MeshInstance3D" parent="."]
+mesh = ExtResource("2_spawn")
+
+[node name="Camera3D" type="Camera3D" parent="."]
+position = Vector3(0, 120, 260)
+rotation_degrees = Vector3(-22, 0, 0)
+far = 2000.0
