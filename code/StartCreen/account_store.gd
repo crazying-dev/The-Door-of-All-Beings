@@ -5,15 +5,17 @@ extends RefCounted
 ##   user://InstallationUniqueID.bin.mac 设备标识的完整性校验码（v1.3 防篡改，见下）
 ##   user://load.bin                  账号信息（JSON：UserName / UserID）
 ##   user://race.txt                  本机选定的种族 key（纯文本，默认 human）
-##   user://player_id.txt             本机玩家 UUID（协议 v1.2：客户端自己生成，注册时交给服务端）
+##   user://player_id.txt             本机玩家 UUID（v1.2 引入、v1.3 沿用：客户端自己生成，注册时交给服务端）
 ##
 ## 单独抽一层的原因：登录流程（userDOM.gd）与确认面板（UserLoaded.gd）都要读它，
 ## 而且旧版本写坏过的内容（例如把 UserID 写成了 null）需要在这里统一兜住。
 ##
 ## 设备标识防篡改（协议 v1.3 / Req6）：设备 ID 文件旁配一个 .mac 校验文件，
 ## 内容是 HMAC-SHA256（密钥 = 机器指纹 + 内置盐）对 ID 原文的签名。
-## 读取时先验签：文件被手改 / 从别的机器拷来（指纹不同）都会校验失败，
-## 此时按「本地标识被写坏」处理（清掉两份文件、向服务端重领），绝不带着脏值去请求。
+## 读取时先验签：文件被手改 / 从别的机器拷来（指纹不同）都会校验失败，绝不带着脏值去请求。
+## **验不过时不自动删**：probe_device_integrity() 只把结论记为 "tampered"，由登录页弹窗
+## 征得用户同意后再 purge_identity() 清掉（见 userDOM._resolve_device_integrity）。
+## 原因：改计算机名 / 换 Windows 用户 / 换机器都会让指纹变，静默删除等于让用户凭空丢号。
 
 const DEVICE_PATH := "user://InstallationUniqueID.bin"
 ## 设备标识的完整性校验码文件（v1.3 防篡改）：与 DEVICE_PATH 同基名 + .mac 后缀。
@@ -22,7 +24,7 @@ const ACCOUNT_PATH := "user://load.bin"
 ## 种族选择单独存一个小文件：账号文件只认 UserName / UserID，
 ## 混在一起的话任何一次 write_account() 都会把种族洗掉。
 const RACE_PATH := "user://race.txt"
-## 协议 v1.2 的 player_id：客户端生成的 RFC 4122 v4 UUID，注册时随 payload 交给服务端。
+## player_id（v1.2 引入、v1.3 沿用）：客户端生成的 RFC 4122 v4 UUID，注册时随 payload 交给服务端。
 ## 与服务端 user_id 是两个东西 —— user_id 仍由服务端生成并作权威主键。
 const PLAYER_ID_PATH := "user://player_id.txt"
 
@@ -130,25 +132,59 @@ static func _const_equal(a: String, b: String) -> bool:
 	return diff == 0
 
 
-## 读取设备标识：先验完整性校验码，验不过 = 被篡改 / 拷自别的机器。
-## 返回空串表示「不可用」（不存在 / 校验失败），调用方按无设备去服务端重领。
-static func read_device_id() -> String:
+## 本地自检的三种结论（probe_device_integrity / device_integrity 的返回值）。
+const INTEGRITY_OK := ""
+## 文件不存在：正常情况（首次运行 / 主动清过）。
+const INTEGRITY_MISSING := "missing"
+## 有明确问题：验签不过 / 只剩半个文件。**不自动删**，等 UI 征得用户同意再清。
+const INTEGRITY_TAMPERED := "tampered"
+
+## 最近一次自检的结论（static：本层是 RefCounted 静态类，没有实例状态）。
+static var _integrity := INTEGRITY_OK
+
+
+## 最近一次自检的结论："" / "missing" / "tampered"。
+static func device_integrity() -> String:
+	return _integrity
+
+
+## 清掉自检结论（用户已确认清除文件，或重新签发成功后用）。
+static func clear_integrity_state() -> void:
+	_integrity = INTEGRITY_OK
+
+
+## 只读自检：**不删除任何文件**，结论写进 device_integrity()。
+## "tampered" 必须由 UI 弹窗征得同意后才能清除（见 userDOM._resolve_device_integrity）。
+static func probe_device_integrity() -> String:
 	var device_id := read_text(DEVICE_PATH)
 	if device_id == "":
-		return ""
+		# 只剩校验码没有 ID：算残留，同样视为异常
+		_integrity = INTEGRITY_TAMPERED if FileAccess.file_exists(DEVICE_MAC_PATH) else INTEGRITY_MISSING
+		return _integrity
 	var stored_mac := read_text(DEVICE_MAC_PATH).to_lower()
 	if stored_mac == "":
 		# 旧版本写的裸文件（没有校验码）：就地补签一次，避免升级把老用户洗成重领。
 		# 注意：这一步等于信任旧内容，只发生在新旧版本交接的第一次读取。
-		if write_device_id(device_id):
-			return device_id
-		return ""
+		if not write_device_id(device_id):
+			_integrity = INTEGRITY_TAMPERED
+			return _integrity
+		return INTEGRITY_OK
 	var expect := _device_mac(device_id)
 	if expect == "" or not _const_equal(expect, stored_mac):
-		push_warning("设备标识完整性校验失败，判定为篡改，已清除本地缓存")
-		clear_device_id()
+		_integrity = INTEGRITY_TAMPERED
+		return _integrity
+	_integrity = INTEGRITY_OK
+	return _integrity
+
+
+## 读取设备标识：先验完整性校验码，验不过 = 被篡改 / 拷自别的机器。
+## 返回空串表示「不可用」（不存在 / 校验失败），调用方按无设备去服务端重领；
+## 但**不清文件**——清除必须显式走 purge_identity()，由 UI 确认后调用。
+static func read_device_id() -> String:
+	if probe_device_integrity() == INTEGRITY_TAMPERED:
+		push_warning("设备标识完整性校验失败（疑似被修改或来自其它电脑）")
 		return ""
-	return device_id
+	return read_text(DEVICE_PATH)
 
 
 ## 写入设备标识：ID 与校验码两份文件必须都成功才算落盘，写坏就全清掉。
@@ -164,12 +200,22 @@ static func write_device_id(device_id: String) -> bool:
 	if not write_text(DEVICE_MAC_PATH, mac):
 		remove_file(DEVICE_PATH)
 		return false
+	clear_integrity_state()
 	return true
 
 
 static func clear_device_id() -> void:
 	remove_file(DEVICE_PATH)
 	remove_file(DEVICE_MAC_PATH)
+	clear_integrity_state()
+
+
+## 「删除残留文件，重新签发」（必须由 UI 征得用户同意后调用）：
+## 设备标识与本地账号是绑定关系，只清 ID 会卡在 DEVICE_MISMATCH（登录）/
+## DEVICE_ALREADY_BOUND（注册），所以两样一起清，让用户走一次全新注册。
+static func purge_identity() -> void:
+	clear_device_id()
+	clear_account()
 
 
 # ---------------------------------------------------------------- 玩家标识

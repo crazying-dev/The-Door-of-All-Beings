@@ -16,11 +16,9 @@ const AccountStore = preload("res://code/StartCreen/account_store.gd")
 ## HTTP 发现请求超时（秒）。
 const DISCOVER_TIMEOUT := 6.0
 
-## 服务端推送的世界快照（10Hz）。
-signal world_pushed(payload: Dictionary)
-## 服务端推送的玩家上下线事件。
-signal event_pushed(payload: Dictionary)
 ## 登录状态变化。
+## v1.3 起服务端**不再主动推送**：世界快照与玩家上下线全部由 net_sync 主动拉取，
+## 所以这里没有 world_pushed / event_pushed 这类「被动接收」信号了。
 signal authenticated_changed(authenticated: bool)
 
 ## 本机设备 ID（hex，1024 字节 → 2048 字符）。
@@ -33,13 +31,13 @@ var user_name := ""
 var authenticated := false
 
 ## 玩家身份（register / login 响应里回显）。
-## `player_id` 是**本机生成的 UUID**（协议 v1.2），服务端拿它做本地标识；
+## `player_id` 是**本机生成的 UUID**（v1.2 引入，v1.3 沿用），服务端拿它做本地标识；
 ## `player_name` 是游戏内显示名；`race` 是种族 key。
 var player_id := ""
 var player_name := ""
 var race := ""
 
-## 登录校验文件哈希（协议 v1.2 可选字段）。**默认空 = 不参与校验**：
+## 登录校验文件哈希（v1.2 引入的可选字段，v1.3 沿用）。**默认空 = 不参与校验**：
 ## 服务端会把首次提交的值钉在库里，之后不一致就拒登（FILE_HASH_MISMATCH），
 ## 客户端一升级就会把自己锁在外面，所以默认不开。
 var file_hash := ""
@@ -53,7 +51,7 @@ var world_rev := 0
 ## hello 拿到的服务端信息。
 var server_version := ""
 var protocol_version := ""
-## v1.3：服务端不再主动推送，固定 0；仅用于展示。
+## v1.3：服务端不再主动推送，hello 回的 `push_hz` 恒为 0（字段为兼容保留），仅用于展示。
 var push_hz := 0.0
 var user_name_max_len := AccountStore.USER_NAME_MAX_LEN
 
@@ -77,7 +75,8 @@ func _ready() -> void:
 	_tcp = TcpClient.new()
 	_tcp.name = "TcpClient"
 	add_child(_tcp)
-	_tcp.pushed.connect(_on_pushed)
+	# v1.3：服务端不再下发任何 PUSH 帧，故不订阅 tcp_client.pushed
+	# （该信号与 _absorb_push_token 仅为兼容 1.2 及更早的服务端而保留）。
 
 
 func tcp():
@@ -176,14 +175,14 @@ func ensure_player_id() -> String:
 	return pid
 
 
-## 名称查重（v1.2 新增动作，注册前调）。
+## 名称查重（v1.2 引入、v1.3 沿用；注册前调）。
 ## 返回统一响应结构；可用性看 `data.available`，原因看 `data.reason`（taken / invalid）。
 ## 老服务端没有这个动作时会回 UNKNOWN_ACTION —— 调用方应当当作「查不了，直接进注册」。
 func check_name(candidate: String) -> Dictionary:
 	return await _call("check_name", candidate.strip_edges(), device_hex)
 
 
-## 注册。payload 为 `<user_name>&<race>&<player_id>`（第三段是本机 UUID，v1.2）。
+## 注册。payload 为 `<user_name>&<race>&<player_id>`（第三段是本机 UUID，v1.2 起）。
 ## `race` 缺省时用本机保存的种族。
 func register(new_user_name: String, new_race := "") -> Dictionary:
 	var chosen := new_race.strip_edges()
@@ -212,7 +211,7 @@ func login(login_user_id: String) -> Dictionary:
 
 
 ## 真正发 `login` 的那一层（不重试）。
-## v1.2 的 payload 是 JSON：`{"player_id", "file_hash"}`；
+## payload 是 JSON（v1.2 起）：`{"player_id", "file_hash"}`；
 ## 协议里的 `player_id` 在登录语境下就是服务端的 `user_id`（见 flows.md §8）。
 ## `file_hash` 为空时不写这个键 —— 服务端按「不参与校验」处理。
 func _login_no_retry(login_user_id: String, device: String) -> Dictionary:
@@ -371,6 +370,7 @@ func login_with_saved_account() -> bool:
 
 ## 上报自身状态。payload：`<x>&<y>&<z>&<yaw>[&hp][&state][&stamina][&mana]`。
 ## 后四段都是可选的；本方法总是带满，方便服务端落库三围。
+## （v1.3 起 net_sync 走 call_batch，真正在用的是下面的 state_payload() + apply_state_response()）
 func send_state(
 	pos: Vector3,
 	yaw_degrees: float,
@@ -379,16 +379,35 @@ func send_state(
 	stamina := 100.0,
 	mana := 100.0,
 ) -> Dictionary:
-	var payload := "%.2f&%.2f&%.2f&%.1f&%.0f&%s&%.0f&%.0f" % [
-		pos.x, pos.y, pos.z, yaw_degrees, hp, state, stamina, mana,
-	]
-	var res: Dictionary = await _call("state", payload)
-	if bool(res.get("ok", false)):
-		var data: Dictionary = res.get("data", {})
-		state_rev = int(data.get("rev", state_rev))
+	var res: Dictionary = await _call("state", state_payload(pos, yaw_degrees, hp, state, stamina, mana))
+	apply_state_response(res)
 	return res
 
 
+## 拼 `state` 动作的 payload（静态：批量请求也要用，不能依赖实例）。
+## 三围与动作词都由调用方决定，本函数只负责格式（保留两位 / 一位小数）。
+static func state_payload(
+	pos: Vector3,
+	yaw_degrees: float,
+	hp := 100.0,
+	state := "idle",
+	stamina := 100.0,
+	mana := 100.0,
+) -> String:
+	return "%.2f&%.2f&%.2f&%.1f&%.0f&%s&%.0f&%.0f" % [
+		pos.x, pos.y, pos.z, yaw_degrees, hp, state, stamina, mana,
+	]
+
+
+## 把 `state` 响应里的行修订号记下来（单发与批量共用同一条路径，保证 state_rev 不丢）。
+func apply_state_response(res: Dictionary) -> void:
+	if not bool(res.get("ok", false)):
+		return
+	var data: Dictionary = res.get("data", {})
+	state_rev = int(data.get("rev", state_rev))
+
+
+## 拉一次在线玩家快照（v1.3：取代服务端 PUSH）。
 func fetch_peers() -> Dictionary:
 	return await _call("peers")
 
@@ -431,7 +450,7 @@ func world_name() -> String:
 	return str(world_meta.get("name", ""))
 
 
-## 本连接的会话 Token（协议 v1.2，空串 = 未拿到 / 已作废）。
+## 本连接的会话 Token（v1.3 随首个 hello 响应下发；空串 = 未拿到 / 已作废）。
 func session_token() -> String:
 	return "" if _tcp == null else str(_tcp.session_token)
 
@@ -439,7 +458,7 @@ func session_token() -> String:
 # ---------------------------------------------------------------- 内部
 
 ## 登录前带上设备（服务端要靠它认人），登录后就不再重复传 2KB 的 hex。
-## v1.2：token 由 TcpClient 自动带上；token 失效时这里会自动重登并重试一次。
+## v1.3：token 由 TcpClient 自动带上（随 hello 下发）；token 失效时这里会自动重登并重试一次。
 func _call(action: String, action_data := "", override_device := "") -> Dictionary:
 	var device := ""
 	if not authenticated:
@@ -466,31 +485,57 @@ func _retry_after_token_reset(action: String, action_data: String) -> Dictionary
 	return await _tcp.request(action, action_data, device, "")
 
 
-func _on_pushed(topic: String, payload: Dictionary) -> void:
-	match topic:
-		"world":
-			world_pushed.emit(payload)
-		"event":
-			if str(payload.get("kind", "")) == "leave" and str(payload.get("user_id", "")) == user_id:
-				set_authenticated(false)
-			event_pushed.emit(payload)
-		"reset_token":
-			# 服务端认定本地拿的是旧 Token（flows.md 流程 5）：重登一次换回来
-			_relogin_after_token_reset.call_deferred()
-		_:
-			pass
+## 发送一条**批量**请求（协议 v1.3）：一条报文带多个动作，服务端按序回多帧。
+## calls 形如 [["state", payload], ["peers", ""]]，返回与 calls 等长的响应数组（顺序一致）。
+## 身份注入与 Token 失效重试跟 _call 走同一套规则；每一帧的含义由调用方自己解释。
+func call_batch(calls: Array) -> Array:
+	if calls.is_empty():
+		return []
+	var device := ""
+	if not authenticated:
+		device = device_hex
+	var results: Array = await _tcp.request_batch(calls, device, "")
+	if not _batch_token_expired(results):
+		return results
+	return await _retry_batch_after_token_reset(calls)
 
 
-## token 被服务端作废后重登（拿回新 token + 重新绑定会话）。
-func _relogin_after_token_reset() -> void:
-	if user_id == "" or device_hex == "":
-		return
-	var res: Dictionary = await _login_no_retry(user_id, device_hex)
-	if bool(res.get("ok", false)):
-		print("会话 Token 已重置，重新登录成功")
-	else:
-		push_warning("会话 Token 重置后重新登录失败：%s" % str(res.get("code", "")))
-		set_authenticated(false)
+## 批量响应里是否出现了 Token 失效（报文级错误：服务端只会回一帧，其余被补成同一码）。
+## BAD_SESSION_TOKEN 也算：token 形状不对（非 32 位 hex），重登拿一张新的就能救回来。
+func _batch_token_expired(results: Array) -> bool:
+	for res in results:
+		if typeof(res) != TYPE_DICTIONARY:
+			continue
+		var code := str(res.get("code", ""))
+		if code == "SESSION_TOKEN_EXPIRED" or code == "BAD_SESSION_TOKEN":
+			return true
+	return false
+
+
+## Token 失效后重登一次并把整批重发（只重试一次，理由同 _retry_after_token_reset）。
+func _retry_batch_after_token_reset(calls: Array) -> Array:
+	push_warning("会话 Token 已失效，重新登录后重试批量请求（%d 个动作）" % calls.size())
+	if _tcp != null:
+		_tcp.clear_token()
+	var device := device_hex
+	if user_id != "" and device != "":
+		var relog: Dictionary = await _login_no_retry(user_id, device)
+		if not bool(relog.get("ok", false)):
+			last_error = _explain(relog, "会话已失效，请重新登录")
+			return _fill_fails(calls.size(), "SESSION_TOKEN_EXPIRED", last_error)
+		device = ""
+	return await _tcp.request_batch(calls, device, "")
+
+
+## 把整批都补成同一条伪失败（重登也失败时用，保证返回长度与 calls 一致）。
+static func _fill_fails(n: int, code: String, message: String) -> Array:
+	var out: Array = []
+	for _i in n:
+		out.append({
+			"kind": "FAIL", "ok": false, "action": "",
+			"code": code, "message": message, "data": {},
+		})
+	return out
 
 
 ## 供 UI 层调用：把服务端错误码转成一句人话。

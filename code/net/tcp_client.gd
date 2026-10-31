@@ -33,6 +33,16 @@ const READ_CHUNK := 8192
 ## 往返均值的平滑系数（越大越跟手，越小越平滑）。
 const RTT_SMOOTH := 0.25
 
+## 报文级（整批）失败码：这些错误都发生在 dispatch **之前**，服务端只会回一帧，
+## 批量请求收到它们就该立刻停止等其它帧，否则要干等到超时。
+## （实测：带错 token 发 2 个动作，服务端只回 `FAIL | state | BAD_SESSION_TOKEN | …` 一帧。）
+const BATCH_FATAL_CODES := [
+	"BAD_MAGIC", "BAD_VERSION", "BAD_ENCRYPTION", "BAD_PLAIN_HASH", "BAD_CIPHER_HASH",
+	"MALFORMED", "TOO_LARGE", "REQUEST_EXPIRED",
+	"BAD_SESSION_TOKEN", "SESSION_TOKEN_EXPIRED",
+	"NOT_READY", "SHUTTING_DOWN", "TOO_MANY_CONNECTIONS",
+]
+
 ## 一条非 PUSH 帧。
 signal response_received(resp: Dictionary)
 ## 服务端主动推送：topic 为 "world" / "event" / "token" / "reset_token"。
@@ -338,8 +348,8 @@ static func _fake_fail(code: String, message: String) -> Dictionary:
 
 
 ## 发送一条批量请求（v1.3）：一条报文携带多个动作，服务端按序返回多帧。
-## calls 形如 [["state","1&2&3&4"], ["peers",""]]。返回与 calls 等长的响应数组
-## （若服务端因报文级错误只回了一帧，末尾会以 TIMEOUT 伪响应补齐）。
+## calls 形如 [["state","1&2&3&4"], ["peers",""]]。返回与 calls 等长的响应数组：
+## 服务端只回了一帧（报文级错误）时，末尾会补成**同一条错误码**（不是全部 TIMEOUT）。
 func request_batch(calls: Array, device_hex := "", user_id := "") -> Array:
 	while _busy:
 		await get_tree().process_frame
@@ -363,20 +373,36 @@ func _request_batch_once(calls: Array, device_hex: String, user_id: String) -> A
 
 	var deadline := Time.get_ticks_msec() + int(timeout_sec * 1000.0)
 	var out: Array = []
-	while out.size() < n and Time.get_ticks_msec() < deadline:
+	var aborted := false
+	while out.size() < n and not aborted and Time.get_ticks_msec() < deadline:
 		while not _inbox.is_empty() and out.size() < n:
-			out.append(_inbox.pop_front())
-		if out.size() >= n:
+			var frame: Dictionary = _inbox.pop_front()
+			out.append(frame)
+			# 报文级失败：服务端只回这一帧（action 还可能是第一个动作名），别死等其它帧
+			if not bool(frame.get("ok", false)) and BATCH_FATAL_CODES.has(str(frame.get("code", "")).strip_edges()):
+				aborted = true
+				break
+		if out.size() >= n or aborted:
 			break
 		if not is_connected_to_server():
 			break
 		await get_tree().process_frame
 	if out.size() == n:
 		_record_rtt(sent_usec)
-	else:
-		# 报文级错误（如 token 失效）会让服务端只回一帧：把缺的都补成 TIMEOUT
-		while out.size() < n:
-			out.append(_fake_fail("TIMEOUT", "批量响应不足（服务端可能只回了一帧）"))
+		return out
+	# 报文级错误（token 失效 / 哈希不符 / 版本不认）会让服务端只回一帧：
+	# 把缺的补成**同一个错误码**，上层才能按真实原因处理（否则会误判成超时）。
+	var code := "TIMEOUT"
+	var message := "批量响应不足（服务端可能只回了一帧）"
+	if not out.is_empty():
+		var first: Dictionary = out[0]
+		if not bool(first.get("ok", false)) and str(first.get("code", "")) != "":
+			code = str(first.get("code", ""))
+			message = str(first.get("message", ""))
+			if message == "":
+				message = "整批请求被服务端拒绝"
+	while out.size() < n:
+		out.append(_fake_fail(code, message))
 	return out
 
 

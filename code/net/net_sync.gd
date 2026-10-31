@@ -6,6 +6,7 @@ extends Node
 ##   2. 以本地可配的间隔上报本机玩家的坐标 / 朝向 / 动作（STATE_INTERVAL）；
 ##   3. **主动拉取**在线玩家快照（PEERS_INTERVAL），把其它玩家渲染成 player.tscn 的
 ##      线条骨架代理，位置做插值，动作按 state 字段切 walk / idle（v1.3：服务端不再推）；
+##      上报与拉取合进**同一条批量报文**（v1.3 批量多 action），一轮只有一次往返。
 ##   4. 某个玩家从 peers 里消失就地拆代理（取代旧 PUSH event join/leave）。
 ##   5. 意外断线时在服务端宽限期内自动重连 + 重登（flows.md 流程 4 / 5）。
 ##
@@ -39,7 +40,7 @@ const RECONNECT_WINDOW := 5.0
 ## 重连失败后的重试间隔（秒）。
 const RECONNECT_INTERVAL := 1.0
 
-## 世界物品快照（首次拉取，以及 world_rev 变化时随 PUSH 下发）。
+## 世界物品快照（首次拉取；v1.3 服务端不再推，后续变更重进世界时重拉）。
 signal world_items_received(items: Array)
 ## 世界元信息（服务端 `world` 响应新增的 `world` 字段：id / name / seed / rev）。
 signal world_meta_received(meta: Dictionary)
@@ -125,7 +126,7 @@ func _after_login() -> void:
 	])
 	if not is_inside_tree():
 		return
-	# 首次进来把世界物品拉一次（后续只在 world_rev 变化时才随 PUSH 下发）；
+	# 首次进来把世界物品拉一次（v1.3 服务端不再推，变更只能靠重进世界时重拉）；
 	# 重连后也拉一次，补上断线期间错过的变更。
 	var res: Dictionary = await _api.fetch_world()
 	if bool(res.get("ok", false)):
@@ -184,21 +185,34 @@ func _process(delta: float) -> void:
 		return
 	_accum += delta
 	_peers_accum += delta
-	var do_state := _accum >= STATE_INTERVAL
-	var do_peers := _peers_accum >= PEERS_INTERVAL
-	if not do_state and not do_peers:
+	var want_state := _accum >= STATE_INTERVAL
+	var want_peers := _peers_accum >= PEERS_INTERVAL
+	if not want_state and not want_peers:
 		return
-	_busy = true
-	if do_state:
+	# v1.3 批量：上报与拉取拼进同一条报文的第 2 行（`a1|d1;;a2|d2`），
+	# 服务端按序回多帧；一轮只花一次往返，比两条单发少一半 RTT 与读放大。
+	var calls: Array = []
+	if want_state:
 		_accum = 0.0
-		await _push_state()
-	if do_peers:
+		calls.append(["state", _state_payload()])
+	if want_peers:
 		_peers_accum = 0.0
-		await _poll_peers()
+		calls.append(["peers", ""])
+	_busy = true
+	var results: Array = await _api.call_batch(calls)
 	_busy = false
+	# 结果与 calls 等长且同序；数量对不上时宁可丢掉尾部也不要错位解释。
+	for i in mini(calls.size(), results.size()):
+		var call: Array = calls[i]
+		match str(call[0]):
+			"state":
+				_on_state_result(results[i])
+			"peers":
+				_on_peers_result(results[i])
 
 
-func _push_state() -> void:
+## 本机上报的 `state` payload（格式由 GameApi.state_payload 统一维护）。
+func _state_payload() -> String:
 	var pos: Vector3 = _player.global_position
 	var yaw := 0.0
 	var speed := 0.0
@@ -207,7 +221,12 @@ func _push_state() -> void:
 	if _player.has_method("get_horizontal_speed"):
 		speed = float(_player.call("get_horizontal_speed"))
 	var motion := MOTION_MOVING if speed > WALK_SPEED else MOTION_IDLE
-	var res: Dictionary = await _api.send_state(pos, yaw, hp, motion, stamina, mana)
+	return _api.state_payload(pos, yaw, hp, motion, stamina, mana)
+
+
+## 处理批量里 `state` 那一帧：只有「服务器不认我了」这一档值得动手，其余交给下一轮。
+func _on_state_result(res: Dictionary) -> void:
+	_api.apply_state_response(res)
 	if bool(res.get("ok", false)):
 		return
 	var code := str(res.get("code", ""))
@@ -218,9 +237,8 @@ func _push_state() -> void:
 
 # ---------------------------------------------------------------- 远端代理
 
-## 拉一次在线玩家快照（取代旧 PUSH world）。拉到的数据交给 _apply_players 重绘代理。
-func _poll_peers() -> void:
-	var res: Dictionary = await _api.fetch_peers()
+## 处理批量里 `peers` 那一帧：拉到的快照交给 _apply_players 重绘代理。
+func _on_peers_result(res: Dictionary) -> void:
 	if bool(res.get("ok", false)):
 		_apply_players(res.get("data", {}))
 
@@ -314,14 +332,6 @@ func _tick_avatars(delta: float) -> void:
 		var current: Vector3 = avatar.global_position
 		avatar.global_position = current.lerp(target["pos"], t)
 		avatar.rotation.y = lerp_angle(avatar.rotation.y, deg_to_rad(float(target["yaw"])), t)
-
-
-func _on_event(payload: Dictionary) -> void:
-	match str(payload.get("kind", "")):
-		"leave":
-			_despawn_avatar(str(payload.get("user_id", "")))
-		_:
-			pass
 
 
 func _on_authenticated(value: bool) -> void:
